@@ -255,12 +255,14 @@ API_ENDPOINTS = [
     {
         "method": "POST", "path": "/api/v1/sessions/{session_id}/send-text",
         "auth": True,
-        "summary": "Send raw text to a session. Set enter=true to append \\r (simulate pressing Enter); default false.",
+        "summary": "Send raw text to a session. Set enter=true to also press Enter after the text.",
         "body": {
             "text": "string, raw text to send",
-            "enter": "bool, append \\r after text (default false)",
+            "enter": "bool, press Enter after the text (default false). Sent as a SEPARATE write to avoid TUI line editors swallowing it as part of the same input batch.",
+            "enter_delay_ms": "int, milliseconds to wait between the text write and the Enter write. Default 30. Set to 0 for legacy single-write behavior.",
         },
         "example": {"text": "ls -la", "enter": True},
+        "notes": "If the text already ends with \\r or \\n, no additional Enter is appended (avoids double-submit).",
     },
     {
         "method": "POST", "path": "/api/v1/sessions/{session_id}/set-title",
@@ -716,9 +718,51 @@ async def handle_send_text(sid, body=None, **_):
             "hint": "Example: {\"text\": \"ls -la\", \"enter\": true}",
         }
     enter = bool(body.get("enter", False))
-    payload = text + ("\r" if enter else "")
-    await session.async_send_text(payload)
-    return 200, {"ok": True, "sent": payload, "enter": enter}
+    # Send text and Enter as two SEPARATE writes when enter=true.
+    #
+    # Combining them into one send_text buffer looks like a single read() to
+    # the target program. Many TUIs (Claude Code, Codex, some REPLs) do
+    # keystroke coalescing / debounce inside their line editor: when the
+    # trailing '\r' arrives glued to the last character in the same batch it
+    # gets swallowed as part of an "insert" event, and the submit never
+    # fires. Sending Enter as a separate RPC lets the target's event loop
+    # observe the input's final state first, then react to the Return key.
+    #
+    # `enter_delay_ms` (default 30) is the pause between the two writes.
+    # Set it to 0 to force the legacy combined-write behavior if you need
+    # bit-for-bit compatibility with an old script.
+    enter_delay_ms = body.get("enter_delay_ms")
+    try:
+        enter_delay_ms = int(enter_delay_ms) if enter_delay_ms is not None else 30
+    except (TypeError, ValueError):
+        enter_delay_ms = 30
+    enter_delay_ms = max(0, min(5000, enter_delay_ms))
+
+    # If the caller already put a CR/LF at the end of the text, don't stack a
+    # second one on top of it — just honor whatever they sent. This preserves
+    # the original {"text":"ls\r"} idiom without doubling the newline.
+    trailing = text.endswith(("\r", "\n"))
+    if enter and not trailing and enter_delay_ms == 0:
+        # Legacy path: single write, text+CR.
+        payload = text + "\r"
+        await session.async_send_text(payload)
+        return 200, {"ok": True, "sent": payload, "enter": enter,
+                     "enter_delay_ms": 0, "split": False}
+
+    await session.async_send_text(text)
+    if enter and not trailing:
+        if enter_delay_ms > 0:
+            await asyncio.sleep(enter_delay_ms / 1000.0)
+        await session.async_send_text("\r")
+
+    return 200, {
+        "ok": True,
+        "sent": text + ("\r" if enter and not trailing else ""),
+        "enter": enter,
+        "enter_delay_ms": enter_delay_ms,
+        "split": enter and not trailing,
+        "trailing_newline_in_text": trailing,
+    }
 
 
 async def handle_set_title(sid, body=None, **_):
