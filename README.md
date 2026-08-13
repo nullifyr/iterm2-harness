@@ -109,9 +109,35 @@ end
   "file_access": {
     "enabled": false,
     "allowed_paths": []
-  }
+  },
+  "auth_prompt_timeout": 60
 }
 ```
+
+### Authorization prompt
+
+`POST /api/v1/auth/request` shows a confirmation panel drawn by the harness
+process itself (via PyObjC), **not** by iTerm2. This matters: iTerm2's own
+`iterm2.Alert` is application-modal and runs on iTerm2's main thread, so an
+unanswered prompt freezes the entire iTerm2 UI *and* stalls its API server —
+with no way to time out. The PyObjC panel leaves iTerm2 untouched, and other
+harness requests continue to be served while it is open.
+
+- `auth_prompt_timeout` — seconds before an unanswered prompt closes itself
+  (default `60`; set `0` to wait forever). Override per-run with the
+  `ITERM2_HARNESS_AUTH_TIMEOUT` env var. The panel shows a live countdown.
+
+Outcomes are distinguishable by status code:
+
+| Result | Status |
+|---|---|
+| User pressed **Allow** | `201` + token |
+| User pressed **Deny**, or closed the panel | `403` |
+| No answer before the countdown expired | `408` |
+
+If the PyObjC panel cannot be shown (no window server, PyObjC missing), the
+harness logs `auth.prompt_fallback` and falls back to `iterm2.Alert` — which
+restores the old blocking, non-cancellable behaviour.
 
 ### File-access config
 

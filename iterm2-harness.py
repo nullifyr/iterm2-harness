@@ -29,6 +29,7 @@ import json
 import os
 import re
 import secrets
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,7 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "allowed_paths": [],
     },
+    "auth_prompt_timeout": 60,
 }
 
 HOME_DIR = Path(os.path.expanduser("~/.iterm2-harness"))
@@ -76,10 +78,17 @@ def load_config():
     host = os.environ.get("ITERM2_HARNESS_HOST", cfg.get("host", DEFAULT_CONFIG["host"]))
     port = int(os.environ.get("ITERM2_HARNESS_PORT", cfg.get("port", DEFAULT_CONFIG["port"])))
     file_access = cfg.get("file_access") or {}
-    return host, port, file_access
+    try:
+        auth_timeout = int(os.environ.get(
+            "ITERM2_HARNESS_AUTH_TIMEOUT",
+            cfg.get("auth_prompt_timeout", DEFAULT_CONFIG["auth_prompt_timeout"])))
+    except (TypeError, ValueError):
+        auth_timeout = DEFAULT_CONFIG["auth_prompt_timeout"]
+    # 0 or negative disables the countdown (wait forever, old behaviour).
+    return host, port, file_access, max(0, auth_timeout)
 
 
-HOST, PORT, FILE_ACCESS = load_config()
+HOST, PORT, FILE_ACCESS, AUTH_PROMPT_TIMEOUT = load_config()
 
 KEY_MAP = {
     "enter": "\r", "return": "\r",
@@ -205,10 +214,14 @@ API_ENDPOINTS = [
     {
         "method": "POST", "path": "/api/v1/auth/request",
         "auth": False,
-        "summary": "Request authorization for a new device. iTerm2 shows a confirmation alert; on approval a token is returned.",
+        "summary": "Request authorization for a new device. A confirmation alert is shown; on approval a token is returned.",
         "body": {"device_name": "string, client device name"},
         "example": {"device_name": "my-laptop"},
         "response": {"token": "auth token", "device_name": "string"},
+        "errors": {
+            "403": "User pressed Deny.",
+            "408": "Prompt closed with no answer (auth_prompt_timeout, default 60s).",
+        },
     },
     {
         "method": "POST", "path": "/api/v1/reload",
@@ -386,20 +399,176 @@ def _check_token(token):
     return tokens.get(token)
 
 
-async def _prompt_user_authorize(device_name, client_addr):
-    """Show an iTerm2 alert and wait for the user's decision."""
-    title = "iterm2-harness authorization request"
-    body = (
-        f"Device: {device_name}\n"
-        f"Origin: {client_addr}\n\n"
-        f"Allow this device to control iTerm2?"
-    )
-    alert = iterm2.Alert(title, body)
+class PromptUnavailable(Exception):
+    """Raised when the PyObjC alert cannot be shown; caller falls back."""
+
+
+# Decision constants for the authorization prompt.
+AUTH_ALLOW, AUTH_DENY, AUTH_TIMEOUT = "allow", "deny", "timeout"
+
+_ALERT_TITLE = "iterm2-harness authorization request"
+
+
+def _alert_body(device_name, client_addr):
+    return (f"Device: {device_name}\n"
+            f"Origin: {client_addr}\n\n"
+            f"Allow this device to control iTerm2?")
+
+
+def _walk_subviews(view):
+    """Yield every descendant of *view*, depth-first."""
+    for sub in (view.subviews() or []):
+        yield sub
+        yield from _walk_subviews(sub)
+
+
+def _build_pyobjc_alert(device_name, client_addr):
+    """Create the NSAlert and show it as a non-modal floating panel.
+
+    AppKit requires NSWindow to be built on the main thread, so this must be
+    called from the asyncio loop's own (main) thread. It deliberately does NOT
+    call runModal(): a modal session would spin a nested runloop and starve
+    asyncio. Instead the panel is ordered front and driven by _pump_pyobjc().
+
+    :returns: (alert, window) — hand both to _pump_pyobjc.
+    :raises PromptUnavailable: if PyObjC or the window server is unusable.
+    """
+    try:
+        import AppKit
+    except Exception as e:
+        raise PromptUnavailable(f"PyObjC unavailable: {e}") from e
+
+    try:
+        app = AppKit.NSApplication.sharedApplication()
+        # Accessory: we get a window server connection and can show/focus a
+        # panel, without ever appearing in the Dock or stealing the menu bar.
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_(_ALERT_TITLE)
+        alert.setInformativeText_(_alert_body(device_name, client_addr))
+        alert.addButtonWithTitle_("Allow")
+        alert.addButtonWithTitle_("Deny")
+        alert.setAlertStyle_(AppKit.NSAlertStyleWarning)
+        alert.setShowsSuppressionButton_(False)
+
+        # runModal() would normally lay the alert out before showing it. We
+        # never call it (it spins a nested runloop that starves asyncio), so
+        # lay out explicitly — otherwise AppKit's lazily-built placeholder
+        # views leak onto the screen: an untitled third button between Allow
+        # and Deny, and a stray "<Do not show this message again>" checkbox.
+        alert.layout()
+
+        window = alert.window()
+        for view in _walk_subviews(window.contentView()):
+            if not isinstance(view, AppKit.NSButton):
+                continue
+            title = str(view.title())
+            # Placeholders are the empty-titled buttons and the suppression
+            # checkbox; the real ones carry the titles we set above.
+            if title in ("", "<Do not show this message again>"):
+                view.setHidden_(True)
+
+        window.setLevel_(AppKit.NSFloatingWindowLevel)
+        window.makeKeyAndOrderFront_(None)
+        app.activateIgnoringOtherApps_(True)
+        return alert, window
+    except PromptUnavailable:
+        raise
+    except Exception as e:
+        raise PromptUnavailable(f"NSAlert failed: {e}") from e
+
+
+async def _prompt_pyobjc(device_name, client_addr, timeout):
+    """Show the auth panel and await the click, without blocking asyncio.
+
+    The panel lives in this process, so iTerm2's main thread — and therefore
+    its UI and its API server — are never touched. We poll the AppKit event
+    queue in short non-blocking slices and `await asyncio.sleep(0)` between
+    them, so every other harness request keeps being served while the panel
+    is up. When the deadline passes we tear the panel down ourselves.
+    """
+    import AppKit
+
+    # Build first, then start the clock: AppKit's first-use initialisation can
+    # take a noticeable moment, and it should not eat into the user's time.
+    alert, window = _build_pyobjc_alert(device_name, client_addr)
+    app = AppKit.NSApplication.sharedApplication()
+    base_text = _alert_body(device_name, client_addr)
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+
+    buttons = alert.buttons()
+    allow_btn, deny_btn = buttons.objectAtIndex_(0), buttons.objectAtIndex_(1)
+
+    try:
+        while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return AUTH_TIMEOUT
+                alert.setInformativeText_(
+                    f"{base_text}\n\n"
+                    f"Auto-denied in {int(remaining) + 1}s if unanswered.")
+
+            # Drain whatever AppKit has queued, without ever blocking:
+            # distantPast means "return nil immediately if nothing is ready".
+            while True:
+                event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                    AppKit.NSEventMaskAny, AppKit.NSDate.distantPast(),
+                    AppKit.NSDefaultRunLoopMode, True)
+                if event is None:
+                    break
+                app.sendEvent_(event)
+
+            if allow_btn.state() == AppKit.NSControlStateValueOn:
+                return AUTH_ALLOW
+            if deny_btn.state() == AppKit.NSControlStateValueOn:
+                return AUTH_DENY
+            if not window.isVisible():
+                # User closed the panel some other way — treat as refusal.
+                return AUTH_DENY
+
+            await asyncio.sleep(0.05)
+    finally:
+        # orderOut_ alone can leave the panel on screen: it only unmaps the
+        # window, and with no modal session to unwind AppKit may never redraw.
+        # close() releases it, and pumping once more lets the window server
+        # process the teardown before we return.
+        try:
+            window.orderOut_(None)
+            window.close()
+            while True:
+                event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                    AppKit.NSEventMaskAny, AppKit.NSDate.distantPast(),
+                    AppKit.NSDefaultRunLoopMode, True)
+                if event is None:
+                    break
+                app.sendEvent_(event)
+        except Exception as e:
+            audit("auth.prompt_teardown_failed", error=str(e))
+
+
+async def _prompt_iterm2_alert(device_name, client_addr):
+    """Fallback: iTerm2's own modal alert.
+
+    This blocks iTerm2's main thread (and thus its whole UI) until answered,
+    and cannot time out — only used when the PyObjC path is unavailable.
+    """
+    alert = iterm2.Alert(_ALERT_TITLE, _alert_body(device_name, client_addr))
     alert.add_button("Allow")
     alert.add_button("Deny")
     selection = await alert.async_run(_connection)
     # First add_button -> 1000, second -> 1001.
-    return selection == 1000
+    return AUTH_ALLOW if selection == 1000 else AUTH_DENY
+
+
+async def _prompt_user_authorize(device_name, client_addr, timeout):
+    """Ask the user to approve a device, preferring the non-blocking prompt."""
+    try:
+        return await _prompt_pyobjc(device_name, client_addr, timeout)
+    except PromptUnavailable as e:
+        audit("auth.prompt_fallback", device_name=device_name, reason=str(e))
+        return await _prompt_iterm2_alert(device_name, client_addr)
 
 
 # ─── Routes ────────────────────────────────────────────────
@@ -482,8 +651,21 @@ async def handle_auth_request(body=None, client_addr=None, **_):
     # Serialize auth flow to avoid stacked alerts.
     async with _auth_lock:
         audit("auth.request", device_name=device_name, client=client_addr)
-        approved = await _prompt_user_authorize(device_name, client_addr or "?")
-        if not approved:
+        decision = await _prompt_user_authorize(
+            device_name, client_addr or "?", AUTH_PROMPT_TIMEOUT)
+
+        if decision == AUTH_TIMEOUT:
+            audit("auth.timeout", device_name=device_name, client=client_addr,
+                  timeout_seconds=AUTH_PROMPT_TIMEOUT)
+            return 408, {
+                "error": "No response from user",
+                "hint": ("The authorization prompt closed after "
+                         f"{AUTH_PROMPT_TIMEOUT}s with no answer. "
+                         "Retry when you are at the machine."),
+                "timeout_seconds": AUTH_PROMPT_TIMEOUT,
+            }
+
+        if decision != AUTH_ALLOW:
             audit("auth.denied", device_name=device_name, client=client_addr)
             return 403, {"error": "Authorization denied by user"}
 
