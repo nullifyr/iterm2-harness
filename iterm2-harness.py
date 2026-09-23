@@ -422,15 +422,61 @@ def _walk_subviews(view):
         yield from _walk_subviews(sub)
 
 
+# AppKit constants the prompt needs, each with its pre-10.12/10.13 SDK spelling
+# as a fallback. iTerm2's bundled Python runtime varies by iTerm2 release, and
+# an older PyObjC may only know the old names.
+_APPKIT_CONSTS = {
+    "accessory": ("NSApplicationActivationPolicyAccessory",),
+    "warning": ("NSAlertStyleWarning", "NSWarningAlertStyle"),
+    "floating": ("NSFloatingWindowLevel",),
+    "event_mask_any": ("NSEventMaskAny", "NSAnyEventMask"),
+    "default_mode": ("NSDefaultRunLoopMode",),
+    "state_on": ("NSControlStateValueOn", "NSOnState"),
+}
+
+
+def _resolve_appkit_consts(AppKit):
+    """Look up every constant up front, before any window exists.
+
+    A name missing mid-prompt would surface as an AttributeError after the
+    panel is already on screen — a 500 instead of the iterm2.Alert fallback.
+
+    :raises PromptUnavailable: if any constant is unknown under every name.
+    """
+    consts = {}
+    for key, names in _APPKIT_CONSTS.items():
+        found = next((getattr(AppKit, n) for n in names if hasattr(AppKit, n)),
+                     None)
+        if found is None:
+            raise PromptUnavailable(f"AppKit lacks {names[0]}")
+        consts[key] = found
+    return consts
+
+
+def _drain_events(app, k):
+    """Dispatch every queued AppKit event without ever blocking.
+
+    distantPast means "return nil immediately if nothing is ready".
+    """
+    import AppKit
+    while True:
+        event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+            k["event_mask_any"], AppKit.NSDate.distantPast(),
+            k["default_mode"], True)
+        if event is None:
+            return
+        app.sendEvent_(event)
+
+
 def _build_pyobjc_alert(device_name, client_addr):
     """Create the NSAlert and show it as a non-modal floating panel.
 
     AppKit requires NSWindow to be built on the main thread, so this must be
     called from the asyncio loop's own (main) thread. It deliberately does NOT
     call runModal(): a modal session would spin a nested runloop and starve
-    asyncio. Instead the panel is ordered front and driven by _pump_pyobjc().
+    asyncio. Instead the panel is ordered front and driven by _prompt_pyobjc().
 
-    :returns: (alert, window) — hand both to _pump_pyobjc.
+    :returns: (alert, window, consts) — hand all three to _prompt_pyobjc.
     :raises PromptUnavailable: if PyObjC or the window server is unusable.
     """
     try:
@@ -438,18 +484,20 @@ def _build_pyobjc_alert(device_name, client_addr):
     except Exception as e:
         raise PromptUnavailable(f"PyObjC unavailable: {e}") from e
 
+    k = _resolve_appkit_consts(AppKit)
+
     try:
         app = AppKit.NSApplication.sharedApplication()
         # Accessory: we get a window server connection and can show/focus a
         # panel, without ever appearing in the Dock or stealing the menu bar.
-        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+        app.setActivationPolicy_(k["accessory"])
 
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_(_ALERT_TITLE)
         alert.setInformativeText_(_alert_body(device_name, client_addr))
         alert.addButtonWithTitle_("Allow")
         alert.addButtonWithTitle_("Deny")
-        alert.setAlertStyle_(AppKit.NSAlertStyleWarning)
+        alert.setAlertStyle_(k["warning"])
         alert.setShowsSuppressionButton_(False)
 
         # runModal() would normally lay the alert out before showing it. We
@@ -469,10 +517,10 @@ def _build_pyobjc_alert(device_name, client_addr):
             if title in ("", "<Do not show this message again>"):
                 view.setHidden_(True)
 
-        window.setLevel_(AppKit.NSFloatingWindowLevel)
+        window.setLevel_(k["floating"])
         window.makeKeyAndOrderFront_(None)
         app.activateIgnoringOtherApps_(True)
-        return alert, window
+        return alert, window, k
     except PromptUnavailable:
         raise
     except Exception as e:
@@ -492,7 +540,7 @@ async def _prompt_pyobjc(device_name, client_addr, timeout):
 
     # Build first, then start the clock: AppKit's first-use initialisation can
     # take a noticeable moment, and it should not eat into the user's time.
-    alert, window = _build_pyobjc_alert(device_name, client_addr)
+    alert, window, k = _build_pyobjc_alert(device_name, client_addr)
     app = AppKit.NSApplication.sharedApplication()
     base_text = _alert_body(device_name, client_addr)
     deadline = time.monotonic() + timeout if timeout > 0 else None
@@ -510,19 +558,11 @@ async def _prompt_pyobjc(device_name, client_addr, timeout):
                     f"{base_text}\n\n"
                     f"Auto-denied in {int(remaining) + 1}s if unanswered.")
 
-            # Drain whatever AppKit has queued, without ever blocking:
-            # distantPast means "return nil immediately if nothing is ready".
-            while True:
-                event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
-                    AppKit.NSEventMaskAny, AppKit.NSDate.distantPast(),
-                    AppKit.NSDefaultRunLoopMode, True)
-                if event is None:
-                    break
-                app.sendEvent_(event)
+            _drain_events(app, k)
 
-            if allow_btn.state() == AppKit.NSControlStateValueOn:
+            if allow_btn.state() == k["state_on"]:
                 return AUTH_ALLOW
-            if deny_btn.state() == AppKit.NSControlStateValueOn:
+            if deny_btn.state() == k["state_on"]:
                 return AUTH_DENY
             if not window.isVisible():
                 # User closed the panel some other way — treat as refusal.
@@ -537,13 +577,7 @@ async def _prompt_pyobjc(device_name, client_addr, timeout):
         try:
             window.orderOut_(None)
             window.close()
-            while True:
-                event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
-                    AppKit.NSEventMaskAny, AppKit.NSDate.distantPast(),
-                    AppKit.NSDefaultRunLoopMode, True)
-                if event is None:
-                    break
-                app.sendEvent_(event)
+            _drain_events(app, k)
         except Exception as e:
             audit("auth.prompt_teardown_failed", error=str(e))
 
@@ -1533,8 +1567,32 @@ async def main(connection):
         f"v{VERSION} listening on {HOST}:{actual_port}",
     )
 
+    # Serve only while the iTerm2 connection lives. serve_forever() alone never
+    # notices iTerm2 quitting or restarting, so the process used to outlive it:
+    # an orphan kept the configured port, answering every request with "no
+    # close frame received or sent", while the fresh instance iTerm2 launched
+    # fell back to port+1 where no client was looking.
+    # The websocket object comes from whatever iterm2/websockets versions the
+    # user's iTerm2 runtime bundles; if it can't tell us when it closes, keep
+    # the old serve-forever behaviour rather than failing to start.
+    wait_closed = getattr(getattr(connection, "websocket", None),
+                          "wait_closed", None)
+    if wait_closed is None:
+        audit("server.no_disconnect_watch",
+              reason="iterm2 connection has no websocket.wait_closed")
+        async with server:
+            await server.serve_forever()
+        return
+
     async with server:
-        await server.serve_forever()
+        serving = asyncio.ensure_future(server.serve_forever())
+        closed = asyncio.ensure_future(wait_closed())
+        await asyncio.wait({serving, closed},
+                           return_when=asyncio.FIRST_COMPLETED)
+        serving.cancel()
+        if closed.done():
+            audit("server.stop", reason="iterm2 connection closed",
+                  port=actual_port)
 
 
 iterm2.run_until_complete(main)
