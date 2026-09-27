@@ -36,11 +36,11 @@ Verify the URL works before doing anything else:
 curl -sf "$BASE_URL/api/v1/health" || echo "Server unreachable at $BASE_URL"
 ```
 
-If the user doesn't know their port, tell them to check the macOS notification toast that appeared on iTerm2 startup ("iterm2-harness started — v0.1.0 listening on …"), or run `curl $BASE_URL/api/v1/health` (and 6771, 6772, … if it fails) until they find it.
+If the user doesn't know their port, tell them to check the macOS notification toast that appeared on iTerm2 startup ("iterm2-harness started — v2.0.0 listening on …"), or run `curl $BASE_URL/api/v1/health` (and 6771, 6772, … if it fails) until they find it.
 
 ## Authentication
 
-Every endpoint **except** `/api/v1/health` and `/api/v1/auth/request` requires a Bearer token.
+Every endpoint **except** `/api/v1/health` and `/api/v1/auth/request` requires a Bearer token. v2 tokens are capability-scoped. Request only the capabilities needed for the current task.
 
 ### Client-side token cache
 
@@ -77,7 +77,7 @@ fi
 if [ -z "$TOKEN" ]; then
   RESP=$(curl -s -X POST $BASE_URL/api/v1/auth/request \
     -H 'Content-Type: application/json' \
-    -d '{"device_name":"claude-cli"}')
+    -d '{"device_name":"claude-cli","scopes":["terminal.read","terminal.write"]}')
   TOKEN=$(echo "$RESP" | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")
   python3 -c "import json,os; \
     json.dump({'host':'127.0.0.1','port':6770,'token':'$TOKEN','device_name':'claude-cli'}, \
@@ -87,6 +87,12 @@ fi
 # 3. Use the token.
 curl -s -H "Authorization: Bearer $TOKEN" $BASE_URL/api/v1/sessions
 ```
+
+### Capability scopes
+
+Available scopes: `terminal.read`, `terminal.write`, `files.read`, `files.write`, `files.delete`, `service.reload`, `auth.manage`.
+
+The default request (when `scopes` is omitted) grants only `terminal.read` and `terminal.write`. Before using file endpoints, obtain a token that explicitly includes the required file scope. Prefer the narrowest set of scopes for the task.
 
 ## Discovery
 

@@ -1,8 +1,9 @@
 {
-  "host": "0.0.0.0",
+  "host": "127.0.0.1",
   "port": 6770,
   "file_access": {
-    "enabled": true,
+    "enabled": false,
     "allowed_paths": []
-  }
+  },
+  "auth_prompt_timeout": 60
 }

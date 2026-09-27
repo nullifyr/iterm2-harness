@@ -25,6 +25,7 @@ Audit:   ~/.iterm2-harness/logs/YYYY-MM-DD.log
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -36,8 +37,31 @@ from pathlib import Path
 
 import iterm2
 
-VERSION = "0.1.0"
-MAX_BODY_SIZE = 32 * 1024 * 1024  # 32 MB; covers JSON bodies and file uploads.
+VERSION = "2.0.0"
+
+# Protocol and resource budgets. Keep these finite: this process shares iTerm2's
+# bundled Python environment and should never let a client turn an API request
+# into unbounded memory/CPU work.
+MAX_BODY_SIZE = 32 * 1024 * 1024
+MAX_REQUEST_LINE = 8 * 1024
+MAX_HEADER_LINE = 8 * 1024
+MAX_HEADER_BYTES = 32 * 1024
+MAX_HEADER_COUNT = 64
+MAX_SCREEN_LINES = 5000
+MAX_FILE_READ_BYTES = 16 * 1024 * 1024
+MAX_LIST_ENTRIES = 2000
+MAX_REGEX_LENGTH = 1024
+
+ALL_SCOPES = {
+    "terminal.read",
+    "terminal.write",
+    "files.read",
+    "files.write",
+    "files.delete",
+    "service.reload",
+    "auth.manage",
+}
+DEFAULT_TOKEN_SCOPES = ["terminal.read", "terminal.write"]
 
 # realpath() so that when this script is installed as a symlink under iTerm2's
 # AutoLaunch folder, config.json is still read from the actual source dir
@@ -46,14 +70,15 @@ SCRIPT_DIR = Path(os.path.dirname(os.path.realpath(__file__)))
 CONFIG_FILE = SCRIPT_DIR / "config.json"
 
 DEFAULT_CONFIG = {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 6770,
     "file_access": {
-        "enabled": True,
+        "enabled": False,
         "allowed_paths": [],
     },
     "auth_prompt_timeout": 60,
 }
+
 
 HOME_DIR = Path(os.path.expanduser("~/.iterm2-harness"))
 TOKENS_FILE = HOME_DIR / "tokens.json"
@@ -116,11 +141,30 @@ def _ensure_dirs():
         pass
 
 
+def _token_hash(token):
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _normalize_scopes(scopes):
+    if scopes is None:
+        return list(DEFAULT_TOKEN_SCOPES)
+    if not isinstance(scopes, list):
+        return None
+    normalized = []
+    for scope in scopes:
+        if not isinstance(scope, str) or scope not in ALL_SCOPES:
+            return None
+        if scope not in normalized:
+            normalized.append(scope)
+    return normalized
+
+
 def _load_tokens():
     if not TOKENS_FILE.exists():
         return {}
     try:
-        return json.loads(TOKENS_FILE.read_text("utf-8"))
+        data = json.loads(TOKENS_FILE.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -134,6 +178,32 @@ def _save_tokens(tokens):
         os.chmod(TOKENS_FILE, 0o600)
     except Exception:
         pass
+
+
+def _lookup_token(token):
+    """Return token metadata, accepting legacy v1 plaintext entries read-only."""
+    if not token:
+        return None
+    tokens = _load_tokens()
+    info = tokens.get(_token_hash(token))
+    if info:
+        return info
+    # v1 stored bearer secrets as dictionary keys. Keep them usable during the
+    # v2 transition, but all newly issued credentials are hash-only.
+    legacy = tokens.get(token)
+    if legacy:
+        legacy = dict(legacy)
+        legacy.setdefault("scopes", sorted(ALL_SCOPES))
+        legacy["legacy_plaintext"] = True
+        return legacy
+    return None
+
+
+def _token_has_scope(token_info, required):
+    if required is None:
+        return True
+    scopes = set((token_info or {}).get("scopes") or [])
+    return required in scopes
 
 
 def audit(event, **fields):
@@ -153,33 +223,89 @@ def audit(event, **fields):
 
 # ─── HTTP protocol ─────────────────────────────────────────
 
+class HTTPRequestError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+async def _readline_limited(reader, limit, what):
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=30)
+    except ValueError:
+        raise HTTPRequestError(431 if what == "header" else 414,
+                               f"{what.capitalize()} too large")
+    if len(line) > limit:
+        raise HTTPRequestError(431 if what == "header" else 414,
+                               f"{what.capitalize()} too large")
+    return line
+
+
 async def read_http_request(reader):
-    request_line = await asyncio.wait_for(reader.readline(), timeout=30)
+    request_line = await _readline_limited(reader, MAX_REQUEST_LINE, "request line")
     if not request_line:
         return None
-    parts = request_line.decode("utf-8").strip().split(" ")
-    if len(parts) < 3:
-        return None
-    method = parts[0].upper()
-    parsed = urllib.parse.urlparse(parts[1])
+    try:
+        decoded = request_line.decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPRequestError(400, "Request line must be ASCII")
+    parts = decoded.rstrip("\r\n").split(" ")
+    if len(parts) != 3:
+        raise HTTPRequestError(400, "Malformed request line")
+    method, target, http_version = parts
+    method = method.upper()
+    if http_version not in ("HTTP/1.0", "HTTP/1.1"):
+        raise HTTPRequestError(505, "Unsupported HTTP version")
+    if any(ord(c) < 0x20 for c in target):
+        raise HTTPRequestError(400, "Invalid request target")
+    parsed = urllib.parse.urlparse(target)
     path = parsed.path
-    query_params = dict(urllib.parse.parse_qsl(parsed.query))
+    query_params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
 
     headers = {}
+    total_header_bytes = 0
+    count = 0
     while True:
-        line = await asyncio.wait_for(reader.readline(), timeout=30)
-        line = line.decode("utf-8").strip()
-        if not line:
+        raw = await _readline_limited(reader, MAX_HEADER_LINE, "header")
+        total_header_bytes += len(raw)
+        if total_header_bytes > MAX_HEADER_BYTES:
+            raise HTTPRequestError(431, "Request headers too large")
+        if raw in (b"\r\n", b"\n", b""):
             break
-        if ":" in line:
-            k, v = line.split(":", 1)
-            headers[k.strip().lower()] = v.strip()
+        count += 1
+        if count > MAX_HEADER_COUNT:
+            raise HTTPRequestError(431, "Too many request headers")
+        try:
+            line = raw.decode("iso-8859-1").rstrip("\r\n")
+        except UnicodeDecodeError:
+            raise HTTPRequestError(400, "Malformed request header")
+        if ":" not in line:
+            raise HTTPRequestError(400, "Malformed request header")
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if k in headers:
+            if k == "content-length":
+                raise HTTPRequestError(400, "Duplicate Content-Length")
+            headers[k] = headers[k] + ", " + v
+        else:
+            headers[k] = v
+
+    if "transfer-encoding" in headers:
+        raise HTTPRequestError(400, "Transfer-Encoding is not supported")
 
     body = b""
-    content_length = int(headers.get("content-length", 0))
+    raw_length = headers.get("content-length", "0")
+    try:
+        content_length = int(raw_length)
+    except (TypeError, ValueError):
+        raise HTTPRequestError(400, "Invalid Content-Length")
+    if content_length < 0:
+        raise HTTPRequestError(400, "Invalid Content-Length")
     if content_length > MAX_BODY_SIZE:
-        raise ValueError("Request body too large")
-    if content_length > 0:
+        raise HTTPRequestError(413, "Request body too large")
+    if content_length:
         body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
 
     return method, path, query_params, headers, body
@@ -188,17 +314,21 @@ async def read_http_request(reader):
 def make_response(status_code, data):
     data["_version"] = VERSION
     status_text = {
-        200: "OK", 201: "Created", 400: "Bad Request",
-        401: "Unauthorized", 403: "Forbidden",
-        404: "Not Found", 405: "Method Not Allowed",
-        409: "Conflict", 500: "Internal Server Error",
+        200: "OK", 201: "Created", 204: "No Content",
+        400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+        404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout",
+        409: "Conflict", 413: "Payload Too Large", 414: "URI Too Long",
+        415: "Unsupported Media Type", 429: "Too Many Requests",
+        431: "Request Header Fields Too Large", 500: "Internal Server Error",
+        505: "HTTP Version Not Supported",
     }
     body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     header = (
         f"HTTP/1.1 {status_code} {status_text.get(status_code, 'Unknown')}\r\n"
         f"Content-Type: application/json; charset=utf-8\r\n"
         f"Content-Length: {len(body)}\r\n"
-        f"Connection: close\r\n\r\n"
+        f"Connection: close\r\n"
+        f"Cache-Control: no-store\r\n\r\n"
     )
     return header.encode("utf-8") + body
 
@@ -215,9 +345,12 @@ API_ENDPOINTS = [
         "method": "POST", "path": "/api/v1/auth/request",
         "auth": False,
         "summary": "Request authorization for a new device. A confirmation alert is shown; on approval a token is returned.",
-        "body": {"device_name": "string, client device name"},
-        "example": {"device_name": "my-laptop"},
-        "response": {"token": "auth token", "device_name": "string"},
+        "body": {
+            "device_name": "string, client device name",
+            "scopes": "optional list of capabilities; defaults to terminal.read + terminal.write",
+        },
+        "example": {"device_name": "my-laptop", "scopes": ["terminal.read"]},
+        "response": {"token": "auth token", "token_id": "revocation id", "device_name": "string", "scopes": "granted capabilities"},
         "errors": {
             "403": "User pressed Deny.",
             "408": "Prompt closed with no answer (auth_prompt_timeout, default 60s).",
@@ -232,6 +365,16 @@ API_ENDPOINTS = [
         "method": "GET", "path": "/api/v1/auth/whoami",
         "auth": True,
         "summary": "Validate the current token and return the owning device info.",
+    },
+    {
+        "method": "GET", "path": "/api/v1/auth/tokens",
+        "auth": True,
+        "summary": "List authorized devices/tokens without exposing bearer secrets. Requires auth.manage.",
+    },
+    {
+        "method": "DELETE", "path": "/api/v1/auth/tokens/{token_id}",
+        "auth": True,
+        "summary": "Revoke an authorized token by token_id. Requires auth.manage.",
     },
     {
         "method": "GET", "path": "/api/v1/windows",
@@ -365,6 +508,8 @@ def api_directory():
             "scheme": "Bearer token in Authorization header",
             "obtain_token": "POST /api/v1/auth/request  (iTerm2 will show a confirmation alert)",
             "header_example": "Authorization: Bearer <token>",
+            "capabilities": sorted(ALL_SCOPES),
+            "default_scopes": DEFAULT_TOKEN_SCOPES,
         },
         "endpoints": API_ENDPOINTS,
     }
@@ -384,6 +529,24 @@ def error_payload(error_msg, hint=None, **extra):
 
 PUBLIC_PATHS = {"/api/v1/health", "/api/v1/auth/request", "/", "/api", "/api/v1"}
 
+HANDLER_SCOPES = {
+    "handle_reload": "service.reload",
+    "handle_whoami": None,
+    "handle_list_tokens": "auth.manage",
+    "handle_revoke_token": "auth.manage",
+    "handle_list_windows": "terminal.read",
+    "handle_list_sessions": "terminal.read",
+    "handle_get_screen": "terminal.read",
+    "handle_get_metadata": "terminal.read",
+    "handle_send_text": "terminal.write",
+    "handle_send_key": "terminal.write",
+    "handle_set_title": "terminal.write",
+    "handle_file_read": "files.read",
+    "handle_file_write": "files.write",
+    "handle_file_delete": "files.delete",
+    "handle_file_list": "files.read",
+}
+
 
 def _extract_token(headers):
     auth = headers.get("authorization", "")
@@ -393,10 +556,7 @@ def _extract_token(headers):
 
 
 def _check_token(token):
-    if not token:
-        return None
-    tokens = _load_tokens()
-    return tokens.get(token)
+    return _lookup_token(token)
 
 
 class PromptUnavailable(Exception):
@@ -409,9 +569,11 @@ AUTH_ALLOW, AUTH_DENY, AUTH_TIMEOUT = "allow", "deny", "timeout"
 _ALERT_TITLE = "iterm2-harness authorization request"
 
 
-def _alert_body(device_name, client_addr):
+def _alert_body(device_name, client_addr, scopes=None):
+    scope_lines = "\n".join(f"  • {scope}" for scope in (scopes or []))
     return (f"Device: {device_name}\n"
             f"Origin: {client_addr}\n\n"
+            f"Requested capabilities:\n{scope_lines or '  • none'}\n\n"
             f"Allow this device to control iTerm2?")
 
 
@@ -468,7 +630,7 @@ def _drain_events(app, k):
         app.sendEvent_(event)
 
 
-def _build_pyobjc_alert(device_name, client_addr):
+def _build_pyobjc_alert(device_name, client_addr, scopes):
     """Create the NSAlert and show it as a non-modal floating panel.
 
     AppKit requires NSWindow to be built on the main thread, so this must be
@@ -494,7 +656,7 @@ def _build_pyobjc_alert(device_name, client_addr):
 
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_(_ALERT_TITLE)
-        alert.setInformativeText_(_alert_body(device_name, client_addr))
+        alert.setInformativeText_(_alert_body(device_name, client_addr, scopes))
         alert.addButtonWithTitle_("Allow")
         alert.addButtonWithTitle_("Deny")
         alert.setAlertStyle_(k["warning"])
@@ -527,7 +689,7 @@ def _build_pyobjc_alert(device_name, client_addr):
         raise PromptUnavailable(f"NSAlert failed: {e}") from e
 
 
-async def _prompt_pyobjc(device_name, client_addr, timeout):
+async def _prompt_pyobjc(device_name, client_addr, timeout, scopes):
     """Show the auth panel and await the click, without blocking asyncio.
 
     The panel lives in this process, so iTerm2's main thread — and therefore
@@ -540,9 +702,9 @@ async def _prompt_pyobjc(device_name, client_addr, timeout):
 
     # Build first, then start the clock: AppKit's first-use initialisation can
     # take a noticeable moment, and it should not eat into the user's time.
-    alert, window, k = _build_pyobjc_alert(device_name, client_addr)
+    alert, window, k = _build_pyobjc_alert(device_name, client_addr, scopes)
     app = AppKit.NSApplication.sharedApplication()
-    base_text = _alert_body(device_name, client_addr)
+    base_text = _alert_body(device_name, client_addr, scopes)
     deadline = time.monotonic() + timeout if timeout > 0 else None
 
     buttons = alert.buttons()
@@ -582,13 +744,13 @@ async def _prompt_pyobjc(device_name, client_addr, timeout):
             audit("auth.prompt_teardown_failed", error=str(e))
 
 
-async def _prompt_iterm2_alert(device_name, client_addr):
+async def _prompt_iterm2_alert(device_name, client_addr, scopes):
     """Fallback: iTerm2's own modal alert.
 
     This blocks iTerm2's main thread (and thus its whole UI) until answered,
     and cannot time out — only used when the PyObjC path is unavailable.
     """
-    alert = iterm2.Alert(_ALERT_TITLE, _alert_body(device_name, client_addr))
+    alert = iterm2.Alert(_ALERT_TITLE, _alert_body(device_name, client_addr, scopes))
     alert.add_button("Allow")
     alert.add_button("Deny")
     selection = await alert.async_run(_connection)
@@ -596,13 +758,13 @@ async def _prompt_iterm2_alert(device_name, client_addr):
     return AUTH_ALLOW if selection == 1000 else AUTH_DENY
 
 
-async def _prompt_user_authorize(device_name, client_addr, timeout):
+async def _prompt_user_authorize(device_name, client_addr, timeout, scopes):
     """Ask the user to approve a device, preferring the non-blocking prompt."""
     try:
-        return await _prompt_pyobjc(device_name, client_addr, timeout)
+        return await _prompt_pyobjc(device_name, client_addr, timeout, scopes)
     except PromptUnavailable as e:
         audit("auth.prompt_fallback", device_name=device_name, reason=str(e))
-        return await _prompt_iterm2_alert(device_name, client_addr)
+        return await _prompt_iterm2_alert(device_name, client_addr, scopes)
 
 
 # ─── Routes ────────────────────────────────────────────────
@@ -615,6 +777,8 @@ ROUTES = [
     ("POST", r"/api/v1/reload$",                            "handle_reload"),
     ("POST", r"/api/v1/auth/request$",                      "handle_auth_request"),
     ("GET",  r"/api/v1/auth/whoami$",                       "handle_whoami"),
+    ("GET",  r"/api/v1/auth/tokens$",                       "handle_list_tokens"),
+    ("DELETE", r"/api/v1/auth/tokens/(?P<token_id>[^/]+)$", "handle_revoke_token"),
     ("GET",  r"/api/v1/windows$",                           "handle_list_windows"),
     ("GET",  r"/api/v1/sessions$",                          "handle_list_sessions"),
     ("GET",  r"/api/v1/sessions/(?P<sid>[^/]+)/screen$",    "handle_get_screen"),
@@ -681,12 +845,18 @@ async def handle_reload(**_):
 async def handle_auth_request(body=None, client_addr=None, **_):
     body = body or {}
     device_name = (body.get("device_name") or "").strip() or "unknown-device"
+    scopes = _normalize_scopes(body.get("scopes"))
+    if scopes is None:
+        return 400, error_payload(
+            "Invalid scopes",
+            hint=f"scopes must be a list containing only: {', '.join(sorted(ALL_SCOPES))}",
+        )
 
-    # Serialize auth flow to avoid stacked alerts.
     async with _auth_lock:
-        audit("auth.request", device_name=device_name, client=client_addr)
+        audit("auth.request", device_name=device_name, client=client_addr,
+              scopes=scopes)
         decision = await _prompt_user_authorize(
-            device_name, client_addr or "?", AUTH_PROMPT_TIMEOUT)
+            device_name, client_addr or "?", AUTH_PROMPT_TIMEOUT, scopes)
 
         if decision == AUTH_TIMEOUT:
             audit("auth.timeout", device_name=device_name, client=client_addr,
@@ -704,20 +874,57 @@ async def handle_auth_request(body=None, client_addr=None, **_):
             return 403, {"error": "Authorization denied by user"}
 
         token = secrets.token_urlsafe(32)
+        token_id = secrets.token_hex(8)
         tokens = _load_tokens()
-        tokens[token] = {
+        tokens[_token_hash(token)] = {
+            "token_id": token_id,
             "device_name": device_name,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "client_addr": client_addr or "",
+            "scopes": scopes,
         }
         _save_tokens(tokens)
-        audit("auth.granted", device_name=device_name, client=client_addr)
-        return 201, {"token": token, "device_name": device_name}
+        audit("auth.granted", device_name=device_name, client=client_addr,
+              token_id=token_id, scopes=scopes)
+        return 201, {
+            "token": token,
+            "token_id": token_id,
+            "device_name": device_name,
+            "scopes": scopes,
+        }
+
+
+async def handle_list_tokens(**_):
+    items = []
+    for key, info in _load_tokens().items():
+        safe = dict(info)
+        safe.pop("legacy_plaintext", None)
+        safe["legacy_plaintext"] = not key.startswith("sha256:")
+        items.append(safe)
+    items.sort(key=lambda x: x.get("created_at", ""))
+    return 200, {"tokens": items}
+
+
+async def handle_revoke_token(token_id, **_):
+    tokens = _load_tokens()
+    for key, info in list(tokens.items()):
+        if info.get("token_id") == token_id:
+            del tokens[key]
+            _save_tokens(tokens)
+            audit("auth.revoked", token_id=token_id,
+                  device_name=info.get("device_name"))
+            return 200, {"revoked": True, "token_id": token_id}
+    return 404, {"error": f"Token id '{token_id}' not found"}
 
 
 async def handle_whoami(token_info=None, **_):
-    return 200, {"device_name": token_info.get("device_name"),
-                 "created_at": token_info.get("created_at")}
+    return 200, {
+        "token_id": token_info.get("token_id"),
+        "device_name": token_info.get("device_name"),
+        "created_at": token_info.get("created_at"),
+        "scopes": token_info.get("scopes", []),
+        "legacy_plaintext": bool(token_info.get("legacy_plaintext")),
+    }
 
 
 async def handle_list_windows(**_):
@@ -765,6 +972,8 @@ async def handle_list_sessions(query_params=None, **_):
         if not haystack:
             return False
         if use_regex:
+            if len(needle) > MAX_REGEX_LENGTH:
+                return False
             try:
                 return re.search(needle, haystack) is not None
             except re.error:
@@ -832,13 +1041,17 @@ async def handle_list_sessions(query_params=None, **_):
     }
 
 
-async def _get_screen_contents(session, limit):
-    request = iterm2.rpc._alloc_request()
-    request.get_buffer_request.session = session.session_id
-    request.get_buffer_request.include_styles = False
-    request.get_buffer_request.line_range.trailing_lines = limit
-    result = await iterm2.rpc._async_call(_connection, request)
-    return iterm2.screen.ScreenContents(result.get_buffer_response)
+def _bounded_int(params, key, default, minimum=0, maximum=None):
+    raw = params.get(key, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{key} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{key} must be <= {maximum}")
+    return value
 
 
 async def handle_get_screen(sid, query_params=None, **_):
@@ -850,37 +1063,42 @@ async def handle_get_screen(sid, query_params=None, **_):
         }
 
     params = query_params or {}
-    limit = int(params.get("limit", "500"))
-    offset = int(params.get("offset", "0"))
+    try:
+        limit = _bounded_int(params, "limit", 500, 1, MAX_SCREEN_LINES)
+        offset = _bounded_int(params, "offset", 0, 0, MAX_SCREEN_LINES * 20)
+    except ValueError as e:
+        return 400, error_payload(str(e))
     strip = params.get("strip", "false").lower() == "true"
 
-    fetch_lines = limit + offset
-    screen = await _get_screen_contents(session, fetch_lines)
-    # \x00 marks empty/continuation cells in the iTerm2 grid (e.g. trailing half
-    # of a wide character). Replace with a space rather than dropping it, or
-    # natural inter-word whitespace gets eaten and words run together.
-    all_lines = [screen.line(i).string.replace("\x00", " ")
-                 for i in range(screen.number_of_lines)]
-    fetched = screen.number_of_lines
-    has_more = fetched >= fetch_lines
+    # Public iTerm2 API only. The transaction keeps line geometry and content
+    # consistent while the terminal is actively changing.
+    async with iterm2.Transaction(_connection):
+        info = await session.async_get_line_info()
+        total = info.scrollback_buffer_height + info.mutable_area_height
+        fetch_count = min(total, limit + offset)
+        first_line = info.overflow + max(0, total - fetch_count)
+        contents = await session.async_get_contents(first_line, fetch_count)
 
-    if offset > 0:
+    all_lines = [line.string.replace("\x00", " ") for line in contents]
+    if offset:
         lines = all_lines[:-offset] if offset < len(all_lines) else []
     else:
         lines = all_lines
-    if limit > 0 and len(lines) > limit:
+    if len(lines) > limit:
         lines = lines[-limit:]
     if strip:
-        # Collapse runs of horizontal whitespace (spaces, tabs) only; preserve
-        # \r/\n if any, so the caller can still see the original line breaks
-        # if a single grid line happened to contain embedded newlines.
-        lines = [re.sub(r"[ \t]+", " ", l).strip(" \t") for l in lines]
-        lines = [l for l in lines if l]
+        lines = [re.sub(r"[ \t]+", " ", line).strip(" \t") for line in lines]
+        lines = [line for line in lines if line]
 
     return 200, {
-        "session_id": sid, "lines": lines,
-        "fetched_lines": fetched, "returned_lines": len(lines),
-        "offset": offset, "has_more": has_more,
+        "session_id": sid,
+        "lines": lines,
+        "fetched_lines": len(all_lines),
+        "returned_lines": len(lines),
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+        "available_lines": total,
+        "overflow": info.overflow,
     }
 
 
@@ -1071,9 +1289,12 @@ def _file_access_check(abs_path):
         ok = False
         for prefix in allowed:
             p = os.path.realpath(os.path.expanduser(prefix))
-            if real == p or real.startswith(p.rstrip("/") + "/"):
-                ok = True
-                break
+            try:
+                if os.path.commonpath([real, p]) == p:
+                    ok = True
+                    break
+            except ValueError:
+                continue
         if not ok:
             return False, 403, {
                 "error": "Path is outside allowed_paths",
@@ -1095,38 +1316,43 @@ def _is_probably_binary(data):
 
 
 async def handle_file_read(query_params, body, raw_body, headers, client_addr, token_info, **_):
-    """GET /api/v1/files — read a file with optional slice/tail/grep/line_numbers."""
+    """GET /api/v1/files — bounded read with optional slice/tail/grep."""
     import base64 as _b64
     path_str = query_params.get("path", "").strip()
-    if not path_str:
-        return 400, error_payload("Missing ?path= query parameter")
-
-    real = os.path.realpath(path_str)
-    fa = FILE_ACCESS
-    if not fa.get("enabled", True):
-        return 403, error_payload("File access is disabled",
-                                  hint="Set file_access.enabled=true in config.json next to the script, then POST /api/v1/reload.")
-    allowed = fa.get("allowed_paths") or []
-    if allowed and not any(real.startswith(os.path.realpath(p)) for p in allowed):
-        return 403, error_payload("Path is outside allowed_paths",
-                                  hint=f"Allowed prefixes: {allowed}")
+    ok, status, info = _file_access_check(path_str)
+    if not ok:
+        return status, error_payload(info.get("error", "File access denied"),
+                                     hint=info.get("hint"),
+                                     **{k: v for k, v in info.items()
+                                        if k not in ("error", "hint")})
+    real = info
 
     if not os.path.exists(real):
         return 404, error_payload(f"File not found: {real}")
     if os.path.isdir(real):
         return 400, error_payload("Path is a directory; use GET /api/v1/files/list instead")
 
+    try:
+        size = os.path.getsize(real)
+    except OSError as e:
+        return 500, error_payload(f"Unable to stat file: {e}")
+    if size > MAX_FILE_READ_BYTES:
+        return 413, error_payload(
+            f"File exceeds the {MAX_FILE_READ_BYTES} byte read limit",
+            hint="Use a narrower allowed file, rotate large logs, or access it through a purpose-built tool.")
+
     use_base64 = query_params.get("base64", "false").lower() == "true"
     try:
-        raw = open(real, "rb").read()
+        with open(real, "rb") as fh:
+            raw = fh.read(MAX_FILE_READ_BYTES + 1)
     except PermissionError:
         return 403, error_payload("Permission denied")
+    except OSError as e:
+        return 500, error_payload(f"Read failed: {e}")
 
     if use_base64:
         return 200, {
-            "path": real,
-            "size": len(raw),
-            "encoding": "base64",
+            "path": real, "size": len(raw), "encoding": "base64",
             "content": _b64.b64encode(raw).decode("ascii"),
         }
 
@@ -1135,7 +1361,7 @@ async def handle_file_read(query_params, body, raw_body, headers, client_addr, t
     except UnicodeDecodeError:
         return 415, error_payload(
             "File appears to be binary",
-            hint="Add ?base64=true to retrieve binary content as a base64-encoded string.")
+            hint="Add ?base64=true to retrieve binary content as base64.")
 
     all_lines = text.splitlines(keepends=True)
     total_lines = len(all_lines)
@@ -1145,69 +1371,70 @@ async def handle_file_read(query_params, body, raw_body, headers, client_addr, t
         if v is None:
             return default
         try:
-            return max(0, int(v))
+            n = int(v)
         except ValueError:
-            return default
+            raise ValueError(f"{key} must be an integer")
+        if n < 0:
+            raise ValueError(f"{key} must be >= 0")
+        return n
 
-    lines_n      = _int("lines")
-    offset_n     = _int("offset", 1)   # 1-based
-    tail_n       = _int("tail")
+    try:
+        lines_n = _int("lines")
+        offset_n = _int("offset", 1)
+        tail_n = _int("tail")
+        grep_ctx = _int("grep_context", 0)
+    except ValueError as e:
+        return 400, error_payload(str(e))
+
     line_numbers = query_params.get("line_numbers", "false").lower() == "true"
-    grep_pat     = query_params.get("grep", "")
-    grep_regex   = query_params.get("grep_regex", "false").lower() == "true"
-    grep_ctx     = _int("grep_context", 0)
+    grep_pat = query_params.get("grep", "")
+    grep_regex = query_params.get("grep_regex", "false").lower() == "true"
+    if len(grep_pat) > MAX_REGEX_LENGTH:
+        return 400, error_payload("grep pattern is too long")
 
-    # --- grep mode ---
     if grep_pat:
         try:
             if grep_regex:
                 pat = re.compile(grep_pat, re.IGNORECASE)
-                match_fn = lambda s: bool(pat.search(s))
+                match_fn = lambda value: bool(pat.search(value))
             else:
                 lp = grep_pat.lower()
-                match_fn = lambda s: lp in s.lower()
+                match_fn = lambda value: lp in value.lower()
         except re.error as e:
             return 400, error_payload(f"Invalid regex: {e}")
 
-        hit_indices = [i for i, l in enumerate(all_lines) if match_fn(l.rstrip("\n\r"))]
-
+        hit_indices = [i for i, line in enumerate(all_lines)
+                       if match_fn(line.rstrip("\n\r"))]
         included = set()
         for hi in hit_indices:
-            for ci in range(max(0, hi - grep_ctx), min(total_lines, hi + grep_ctx + 1)):
+            for ci in range(max(0, hi - grep_ctx),
+                            min(total_lines, hi + grep_ctx + 1)):
                 included.add(ci)
-        included = sorted(included)
 
         out_lines = []
         prev = None
-        for ci in included:
+        for ci in sorted(included):
             if prev is not None and ci > prev + 1:
                 out_lines.append("--\n")
-            lno = ci + 1
-            out_lines.append(f"{lno:>6}: {all_lines[ci]}")
+            out_lines.append(f"{ci + 1:>6}: {all_lines[ci]}")
             prev = ci
 
         if lines_n is not None:
-            filtered = []
-            count = 0
-            for l in out_lines:
-                filtered.append(l)
-                if l != "--\n":
+            filtered, count = [], 0
+            for line in out_lines:
+                filtered.append(line)
+                if line != "--\n":
                     count += 1
                     if count >= lines_n:
                         break
             out_lines = filtered
 
-        content = "".join(out_lines)
         return 200, {
-            "path": real,
-            "size": len(raw),
-            "total_lines": total_lines,
-            "returned_lines": sum(1 for l in out_lines if l != "--\n"),
-            "encoding": "utf-8",
-            "content": content,
+            "path": real, "size": len(raw), "total_lines": total_lines,
+            "returned_lines": sum(1 for line in out_lines if line != "--\n"),
+            "encoding": "utf-8", "content": "".join(out_lines),
         }
 
-    # --- tail mode ---
     if tail_n is not None:
         start = max(0, total_lines - tail_n)
         sliced = all_lines[start:]
@@ -1218,21 +1445,13 @@ async def handle_file_read(query_params, body, raw_body, headers, client_addr, t
         first_lno = start + 1
 
     has_more = (first_lno + len(sliced) - 1) < total_lines
-
-    if line_numbers:
-        content = "".join(f"{first_lno + i:>6}: {l}" for i, l in enumerate(sliced))
-    else:
-        content = "".join(sliced)
-
+    content = ("".join(f"{first_lno + i:>6}: {line}"
+                       for i, line in enumerate(sliced))
+               if line_numbers else "".join(sliced))
     return 200, {
-        "path": real,
-        "size": len(raw),
-        "total_lines": total_lines,
-        "returned_lines": len(sliced),
-        "offset": first_lno,
-        "has_more": has_more,
-        "encoding": "utf-8",
-        "content": content,
+        "path": real, "size": len(raw), "total_lines": total_lines,
+        "returned_lines": len(sliced), "offset": first_lno,
+        "has_more": has_more, "encoding": "utf-8", "content": content,
     }
 
 
@@ -1353,20 +1572,43 @@ async def handle_file_list(query_params=None, **_):
         }
 
     entries = []
+    truncated = False
+
+    def add_entry(full):
+        nonlocal truncated
+        if len(entries) >= MAX_LIST_ENTRIES:
+            truncated = True
+            return False
+        entries.append(_describe_entry(full, real))
+        return True
+
     try:
         if recursive:
+            stop = False
             for root, dirs, files in os.walk(real):
                 for name in dirs:
-                    entries.append(_describe_entry(os.path.join(root, name), real))
+                    if not add_entry(os.path.join(root, name)):
+                        stop = True
+                        break
+                if stop:
+                    break
                 for name in files:
-                    entries.append(_describe_entry(os.path.join(root, name), real))
+                    if not add_entry(os.path.join(root, name)):
+                        stop = True
+                        break
+                if stop:
+                    break
         else:
             for name in sorted(os.listdir(real)):
-                entries.append(_describe_entry(os.path.join(real, name), real))
+                if not add_entry(os.path.join(real, name)):
+                    break
     except OSError as e:
         return 500, {"error": f"List failed: {e}"}
 
-    return 200, {"path": real, "recursive": recursive, "entries": entries}
+    return 200, {
+        "path": real, "recursive": recursive, "entries": entries,
+        "truncated": truncated, "limit": MAX_LIST_ENTRIES,
+    }
 
 
 def _describe_entry(full, root):
@@ -1394,6 +1636,8 @@ HANDLERS = {
     "handle_reload": handle_reload,
     "handle_auth_request": handle_auth_request,
     "handle_whoami": handle_whoami,
+    "handle_list_tokens": handle_list_tokens,
+    "handle_revoke_token": handle_revoke_token,
     "handle_list_windows": handle_list_windows,
     "handle_list_sessions": handle_list_sessions,
     "handle_get_screen": handle_get_screen,
@@ -1460,7 +1704,7 @@ async def handle_client(reader, writer):
             await writer.drain()
             return
 
-        # Auth check.
+        # Authentication and capability authorization.
         token_info = None
         if path not in PUBLIC_PATHS:
             token = _extract_token(headers)
@@ -1470,8 +1714,20 @@ async def handle_client(reader, writer):
                 audit("auth.reject", method=method, path=path, client=client_addr)
                 writer.write(make_response(401, error_payload(
                     "Missing or invalid token",
-                    hint="Call POST /api/v1/auth/request first (iTerm2 will show a confirmation alert). "
-                         "Then pass the returned token via 'Authorization: Bearer <token>'.",
+                    hint="Call POST /api/v1/auth/request first, then pass the returned token as a Bearer token.",
+                )))
+                await writer.drain()
+                return
+            required_scope = HANDLER_SCOPES.get(handler_name)
+            if not _token_has_scope(token_info, required_scope):
+                status = 403
+                audit("auth.scope_denied", method=method, path=path,
+                      client=client_addr, required_scope=required_scope,
+                      token_id=token_info.get("token_id"))
+                writer.write(make_response(403, error_payload(
+                    "Token lacks required capability",
+                    required_scope=required_scope,
+                    granted_scopes=token_info.get("scopes", []),
                 )))
                 await writer.drain()
                 return
@@ -1500,6 +1756,15 @@ async def handle_client(reader, writer):
         writer.write(make_response(status, data))
         await writer.drain()
 
+    except HTTPRequestError as e:
+        status = e.status
+        audit("request.reject", method=method, path=path, client=client_addr,
+              status=e.status, error=e.message)
+        try:
+            writer.write(make_response(e.status, error_payload(e.message)))
+            await writer.drain()
+        except Exception:
+            pass
     except Exception as e:
         audit("error", method=method, path=path, client=client_addr, error=str(e))
         try:
@@ -1525,7 +1790,9 @@ async def _start_server_with_fallback(host, start_port, max_tries=PORT_FALLBACK_
     for offset in range(max_tries):
         port = start_port + offset
         try:
-            server = await asyncio.start_server(handle_client, host, port)
+            server = await asyncio.start_server(
+                handle_client, host, port,
+                limit=max(MAX_REQUEST_LINE, MAX_HEADER_LINE) + 1024)
             if offset > 0:
                 audit("server.port_fallback",
                       requested=start_port, actual=port, offset=offset)
@@ -1567,32 +1834,9 @@ async def main(connection):
         f"v{VERSION} listening on {HOST}:{actual_port}",
     )
 
-    # Serve only while the iTerm2 connection lives. serve_forever() alone never
-    # notices iTerm2 quitting or restarting, so the process used to outlive it:
-    # an orphan kept the configured port, answering every request with "no
-    # close frame received or sent", while the fresh instance iTerm2 launched
-    # fell back to port+1 where no client was looking.
-    # The websocket object comes from whatever iterm2/websockets versions the
-    # user's iTerm2 runtime bundles; if it can't tell us when it closes, keep
-    # the old serve-forever behaviour rather than failing to start.
-    wait_closed = getattr(getattr(connection, "websocket", None),
-                          "wait_closed", None)
-    if wait_closed is None:
-        audit("server.no_disconnect_watch",
-              reason="iterm2 connection has no websocket.wait_closed")
-        async with server:
-            await server.serve_forever()
-        return
+    # iTerm2's documented daemon lifecycle owns process termination. Keeping
+    # serve_forever in a background task avoids depending on private websocket
+    # attributes while still leaving the HTTP listener active.
+    asyncio.create_task(server.serve_forever())
 
-    async with server:
-        serving = asyncio.ensure_future(server.serve_forever())
-        closed = asyncio.ensure_future(wait_closed())
-        await asyncio.wait({serving, closed},
-                           return_when=asyncio.FIRST_COMPLETED)
-        serving.cancel()
-        if closed.done():
-            audit("server.stop", reason="iterm2 connection closed",
-                  port=actual_port)
-
-
-iterm2.run_until_complete(main)
+iterm2.run_forever(main)

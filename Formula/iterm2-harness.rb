@@ -1,10 +1,10 @@
 class Iterm2Harness < Formula
   desc "HTTP API for remote-controlling iTerm2 (auth + audit + AutoLaunch)"
-  homepage "https://github.com/wsvn53/iterm2-harness"
-  url "https://github.com/wsvn53/iterm2-harness/archive/refs/heads/main.tar.gz"
-  version "0.1.0"
+  homepage "https://github.com/nullifyr/iterm2-harness"
+  url "https://github.com/nullifyr/iterm2-harness/archive/refs/heads/main.tar.gz"
+  version "2.0.0"
   license "Apache-2.0"
-  head "https://github.com/wsvn53/iterm2-harness.git", branch: "main"
+  head "https://github.com/nullifyr/iterm2-harness.git", branch: "main"
 
   depends_on :macos
 

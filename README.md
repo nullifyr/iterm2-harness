@@ -1,8 +1,8 @@
-# iTerm2 Harness
+# iTerm2 Harness v2
 
 An **AI-friendly control surface for iTerm2**, built on iTerm2's official Python API. It exposes a small, self-describing HTTP API that lets an AI agent (Claude Code, GPT-based tools, custom scripts, …) automate your iTerm2 workspace — list windows / tabs / sessions, read screen contents with scrollback, send text and keystrokes, rename sessions, and so on.
 
-Includes **simple but real authorization**: every new device must be approved via an iTerm2 modal alert; the resulting Bearer token is reused on subsequent requests. All actions are written to a daily JSON-line audit log so you can see exactly what your agent did.
+Includes capability-scoped authorization: every new device must be approved via an iTerm2 prompt and requests only the capabilities it needs (terminal read/write, file read/write/delete, service reload, or auth management). Bearer secrets are stored hashed at rest, and actions are written to a daily JSON-line audit log.
 
 Designed to be installed into iTerm2's `AutoLaunch` directory so the service starts with iTerm2.
 
@@ -34,7 +34,10 @@ The driver agent picks which pane runs which coding agent (Claude Code, Codex, G
 ## Features
 
 - HTTP REST API (no extra deps; uses iTerm2's bundled Python runtime).
-- Bearer-token auth; new devices must be approved via an iTerm2 modal.
+- Capability-scoped Bearer-token auth; new devices must be approved locally.
+- Safe defaults: loopback-only bind and file access disabled until explicitly enabled.
+- Bounded HTTP headers, bodies, scrollback reads, file reads, directory listings, and regex patterns.
+- Public iTerm2 session APIs for scrollback access; no private `iterm2.rpc._*` dependency.
 - Daily JSON-line audit logs at `~/.iterm2-harness/logs/`.
 - Auto port fallback when the configured port is busy.
 - macOS notification-center toast when the server starts.
@@ -48,7 +51,7 @@ The driver agent picks which pane runs which coding agent (Claude Code, Codex, G
 This repo ships its own formula under `Formula/iterm2-harness.rb`, so it can be installed via `brew tap` directly:
 
 ```bash
-brew tap wsvn53/iterm2-harness https://github.com/wsvn53/iterm2-harness
+brew tap wsvn53/iterm2-harness https://github.com/nullifyr/iterm2-harness
 brew install iterm2-harness
 ```
 
@@ -271,9 +274,30 @@ Audit events: `server.start`, `server.reload`, `server.port_busy`, `server.port_
 
 ## Security notes
 
-- Default bind is `0.0.0.0` for LAN access. Set `host` to `127.0.0.1` in `config.json` to restrict to the local machine.
-- Tokens are 256-bit URL-safe random strings.
-- macOS Local Network permission may be requested on first use; allow it for iTerm2 if you want LAN clients.
+v2 is intentionally secure-by-default:
+
+- The default listener is `127.0.0.1:6770`, not all LAN interfaces.
+- File access is disabled by default. When enabled, use `allowed_paths` to constrain it.
+- An empty `allowed_paths` list means unrestricted filesystem access **only after** file access has explicitly been enabled.
+- New tokens are stored as SHA-256 hashes in `~/.iterm2-harness/tokens.json`; the bearer secret is only returned at issuance.
+- Tokens carry explicit capabilities: `terminal.read`, `terminal.write`, `files.read`, `files.write`, `files.delete`, `service.reload`, and `auth.manage`.
+- Legacy v1 plaintext tokens continue to work during migration and are treated as full-capability credentials; revoke/reissue them when convenient.
+- For remote use, prefer an SSH tunnel, Tailscale, WireGuard, or another authenticated encrypted transport rather than exposing the plaintext HTTP listener directly.
+
+### v1 → v2 migration
+
+The network and file defaults changed. Existing `config.json` files are preserved, so an installation that explicitly used `0.0.0.0` or enabled file access will continue to do so. Fresh installs use the safer defaults.
+
+Clients that call only terminal endpoints can omit `scopes` during `POST /api/v1/auth/request`; the default is `terminal.read` + `terminal.write`. File access, reload, and token administration must be requested explicitly.
+
+```json
+{
+  "device_name": "codex",
+  "scopes": ["terminal.read", "terminal.write", "files.read", "files.write"]
+}
+```
+
+Token administrators can list issued credentials with `GET /api/v1/auth/tokens` and revoke one with `DELETE /api/v1/auth/tokens/{token_id}`; both require `auth.manage`.
 
 ## License
 
