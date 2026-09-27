@@ -51,7 +51,7 @@ The driver agent picks which pane runs which coding agent (Claude Code, Codex, G
 This repo ships its own formula under `Formula/iterm2-harness.rb`, so it can be installed via `brew tap` directly:
 
 ```bash
-brew tap wsvn53/iterm2-harness https://github.com/nullifyr/iterm2-harness
+brew tap nullifyr/iterm2-harness https://github.com/nullifyr/iterm2-harness
 brew install iterm2-harness
 ```
 

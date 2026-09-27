@@ -57,6 +57,23 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(h._normalize_scopes(["files.read"]), ["files.read"])
         self.assertIsNone(h._normalize_scopes(["root"]))
 
+    def test_auth_prompt_rate_limit(self):
+        old = h._auth_attempts
+        try:
+            h._auth_attempts = {}
+            for i in range(h.AUTH_RATE_MAX_ATTEMPTS):
+                self.assertTrue(h._auth_rate_allowed("127.0.0.1:1234", now=float(i)))
+            self.assertFalse(h._auth_rate_allowed(
+                "127.0.0.1:5678", now=float(h.AUTH_RATE_MAX_ATTEMPTS)))
+        finally:
+            h._auth_attempts = old
+
+    def test_legacy_token_has_nonsecret_revocation_id(self):
+        secret = "legacy-bearer-secret"
+        token_id = h._legacy_token_id(secret)
+        self.assertTrue(token_id.startswith("legacy-"))
+        self.assertNotIn(secret, token_id)
+
     def test_duplicate_content_length_is_rejected(self):
         async def run():
             reader = asyncio.StreamReader()

@@ -128,6 +128,9 @@ KEY_MAP = {
 
 _connection = None
 _auth_lock = asyncio.Lock()
+_auth_attempts = {}
+AUTH_RATE_WINDOW_SECONDS = 60
+AUTH_RATE_MAX_ATTEMPTS = 5
 
 
 # ─── Storage and audit ─────────────────────────────────────
@@ -206,6 +209,24 @@ def _token_has_scope(token_info, required):
     return required in scopes
 
 
+def _legacy_token_id(storage_key):
+    return "legacy-" + hashlib.sha256(storage_key.encode("utf-8")).hexdigest()[:16]
+
+
+def _auth_rate_allowed(client_addr, now=None):
+    """Bound unauthenticated approval prompts per client address."""
+    now = time.monotonic() if now is None else now
+    key = (client_addr or "?").rsplit(":", 1)[0]
+    cutoff = now - AUTH_RATE_WINDOW_SECONDS
+    recent = [t for t in _auth_attempts.get(key, []) if t >= cutoff]
+    if len(recent) >= AUTH_RATE_MAX_ATTEMPTS:
+        _auth_attempts[key] = recent
+        return False
+    recent.append(now)
+    _auth_attempts[key] = recent
+    return True
+
+
 def audit(event, **fields):
     """Append a JSON line to today's audit log."""
     _ensure_dirs()
@@ -233,6 +254,8 @@ class HTTPRequestError(Exception):
 async def _readline_limited(reader, limit, what):
     try:
         line = await asyncio.wait_for(reader.readline(), timeout=30)
+    except asyncio.TimeoutError:
+        raise HTTPRequestError(408, "Request timed out")
     except ValueError:
         raise HTTPRequestError(431 if what == "header" else 414,
                                f"{what.capitalize()} too large")
@@ -306,7 +329,13 @@ async def read_http_request(reader):
     if content_length > MAX_BODY_SIZE:
         raise HTTPRequestError(413, "Request body too large")
     if content_length:
-        body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
+        try:
+            body = await asyncio.wait_for(
+                reader.readexactly(content_length), timeout=30)
+        except asyncio.TimeoutError:
+            raise HTTPRequestError(408, "Request body timed out")
+        except asyncio.IncompleteReadError:
+            raise HTTPRequestError(400, "Request body shorter than Content-Length")
 
     return method, path, query_params, headers, body
 
@@ -844,6 +873,12 @@ async def handle_reload(**_):
 
 async def handle_auth_request(body=None, client_addr=None, **_):
     body = body or {}
+    if not _auth_rate_allowed(client_addr):
+        audit("auth.rate_limited", client=client_addr)
+        return 429, {
+            "error": "Too many authorization requests",
+            "retry_after_seconds": AUTH_RATE_WINDOW_SECONDS,
+        }
     device_name = (body.get("device_name") or "").strip() or "unknown-device"
     scopes = _normalize_scopes(body.get("scopes"))
     if scopes is None:
@@ -898,8 +933,12 @@ async def handle_list_tokens(**_):
     items = []
     for key, info in _load_tokens().items():
         safe = dict(info)
+        is_legacy = not key.startswith("sha256:")
         safe.pop("legacy_plaintext", None)
-        safe["legacy_plaintext"] = not key.startswith("sha256:")
+        safe["legacy_plaintext"] = is_legacy
+        if is_legacy:
+            safe.setdefault("token_id", _legacy_token_id(key))
+            safe.setdefault("scopes", sorted(ALL_SCOPES))
         items.append(safe)
     items.sort(key=lambda x: x.get("created_at", ""))
     return 200, {"tokens": items}
@@ -908,7 +947,10 @@ async def handle_list_tokens(**_):
 async def handle_revoke_token(token_id, **_):
     tokens = _load_tokens()
     for key, info in list(tokens.items()):
-        if info.get("token_id") == token_id:
+        stored_id = info.get("token_id")
+        if stored_id is None and not key.startswith("sha256:"):
+            stored_id = _legacy_token_id(key)
+        if stored_id == token_id:
             del tokens[key]
             _save_tokens(tokens)
             audit("auth.revoked", token_id=token_id,
@@ -1496,11 +1538,15 @@ async def handle_file_write(query_params=None, body=None, raw_body=None, headers
         if encoding == "base64":
             import base64
             try:
-                data = base64.b64decode(content)
+                data = base64.b64decode(content, validate=True)
             except Exception as e:
                 return 400, {"error": f"Invalid base64 content: {e}"}
+        elif encoding == "utf-8":
+            if not isinstance(content, str):
+                return 400, {"error": "utf-8 content must be a string"}
+            data = content.encode("utf-8")
         else:
-            data = content.encode(encoding, "strict") if isinstance(content, str) else content
+            return 400, {"error": "encoding must be 'utf-8' or 'base64'"}
 
     parent = os.path.dirname(real)
     existed = os.path.exists(real)
@@ -1671,11 +1717,18 @@ async def handle_client(reader, writer):
         if raw_body and not ctype.startswith("multipart/"):
             try:
                 body = json.loads(raw_body.decode("utf-8"))
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 status = 400
                 writer.write(make_response(400, error_payload(
                     "Invalid JSON body",
                     hint="Request body must be valid JSON. See endpoints[].example for the expected fields."
+                )))
+                await writer.drain()
+                return
+            if not isinstance(body, dict):
+                status = 400
+                writer.write(make_response(400, error_payload(
+                    "JSON body must be an object"
                 )))
                 await writer.drain()
                 return
