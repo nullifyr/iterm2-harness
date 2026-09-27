@@ -1,9 +1,10 @@
 {
   "host": "127.0.0.1",
   "port": 6770,
-  "file_access": {
-    "enabled": false,
-    "allowed_paths": []
-  },
-  "auth_prompt_timeout": 60
+  "allow_remote": false,
+  "file_access": {"enabled": false, "allowed_paths": []},
+  "auth_prompt_timeout": 60,
+  "require_input_approval": false,
+  "protect_focused_session": true,
+  "allowed_profiles": []
 }

@@ -1,304 +1,158 @@
-# iTerm2 Harness v2
+# iTerm2 Harness 2.1
 
-An **AI-friendly control surface for iTerm2**, built on iTerm2's official Python API. It exposes a small, self-describing HTTP API that lets an AI agent (Claude Code, GPT-based tools, custom scripts, …) automate your iTerm2 workspace — list windows / tabs / sessions, read screen contents with scrollback, send text and keystrokes, rename sessions, and so on.
+An authenticated HTTP bridge to the user's real iTerm2 workspace, with scoped
+credentials, observable shell activity, bounded event replay, and guarded input.
+It uses iTerm2's public Python API and the standard library; AppKit/PyObjC is used
+for local consent. It does **not** inherit native iTerm2 AI Chat permissions.
 
-Includes capability-scoped authorization: every new device must be approved via an iTerm2 prompt and requests only the capabilities it needs (terminal read/write, file read/write/delete, service reload, or auth management). Bearer secrets are stored hashed at rest, and actions are written to a daily JSON-line audit log.
+## What is implemented
 
-Designed to be installed into iTerm2's `AutoLaunch` directory so the service starts with iTerm2.
+- Session/window inventory, concrete session metadata, bounded terminal-grid reads.
+- Server-sent events (SSE): prompt/command observations, screen invalidations,
+  session/layout/focus changes, and explicitly reported agent status.
+- Bounded command history observed since the harness started. Exit events are
+  correlated only when a native prompt ID is available and matches.
+- Expiring agent reports with reporter identity, sequence numbers, and provenance.
+  These are separate from shell state and are **not native Session Status reads**.
+- Create windows/tabs/splits, activate sessions, close individual sessions, rename,
+  send text/keys, and get/set the `user.harness.*` variable namespace.
+- Session-scoped credentials, expiry/revocation, input leases, context checks,
+  idempotency receipts, broadcast suppression, and local approval for destructive
+  or workspace-creating operations.
+- Optional, explicitly rooted regular-file access. No arbitrary Python regex or
+  multipart parsing; no file access by default.
 
-```
-   ┌──────────────────────────────────────────────────────────────┐
-   │            Driver Agent  (OpenClaw / HermesAgent /           │
-   │              Minis / your own orchestrator)                  │
-   └──────────────┬───────────────────────────────────────────────┘
-                  │  HTTP + Bearer token
-                  ▼
-        ┌────────────────────┐
-        │  iterm2-harness    │   auth · audit · API directory
-        │   (HTTP server)    │
-        └─────────┬──────────┘
-                  │  iTerm2 Python API
-                  ▼
-   ┌──────────────────────────────────────────────────────────────┐
-   │                          iTerm2.app                          │
-   │ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌───────┐ │
-   │ │ pane: claude │ │ pane: codex  │ │ pane: gemini │ │  …    │ │
-   │ │  (Claude Code)│ │              │ │              │ │       │ │
-   │ └──────────────┘ └──────────────┘ └──────────────┘ └───────┘ │
-   │  list / read screen / send keys / rename · per native CLI    │
-   └──────────────────────────────────────────────────────────────┘
-```
-
-The driver agent picks which pane runs which coding agent (Claude Code, Codex, Gemini CLI, OpenCode, …), sends prompts and keystrokes to each one, reads the screen back to track progress, and orchestrates handoffs between them — all without leaving the user's real iTerm2 workspace.
-
-## Features
-
-- HTTP REST API (no extra deps; uses iTerm2's bundled Python runtime).
-- Capability-scoped Bearer-token auth; new devices must be approved locally.
-- Safe defaults: loopback-only bind and file access disabled until explicitly enabled.
-- Bounded HTTP headers, bodies, scrollback reads, file reads, directory listings, and regex patterns.
-- Public iTerm2 session APIs for scrollback access; no private `iterm2.rpc._*` dependency.
-- Daily JSON-line audit logs at `~/.iterm2-harness/logs/`.
-- Auto port fallback when the configured port is busy.
-- macOS notification-center toast when the server starts.
-- Progressive disclosure: every error response embeds the full API directory so clients can self-discover endpoints.
-- `POST /api/v1/reload` to restart the script in place.
+`GET /api/v2/capabilities` distinguishes implemented features from unimplemented
+native Workgroups, AI Chat control, browser automation, selection/annotations,
+structured command execution, and MCP. A GUI feature is not assumed to have a
+usable Python API. This is an implementation tranche, not feature parity with
+native iTerm2 AI.
 
 ## Install
 
-### Homebrew (recommended)
+Requires macOS, iTerm2 with its Python API enabled, and a **Python 3.9+** iTerm2
+runtime. Use a currently maintained Python runtime when available. Local consent
+also requires working PyObjC/AppKit in that runtime. If it is unavailable, requests
+requiring consent fail closed; there is no blocking modal fallback.
 
-This repo ships its own formula under `Formula/iterm2-harness.rb`, so it can be installed via `brew tap` directly:
-
-```bash
-brew tap nullifyr/iterm2-harness https://github.com/nullifyr/iterm2-harness
-brew install iterm2-harness
-```
-
-The formula automatically symlinks the script into iTerm2's `AutoLaunch` folder during `post_install`, so iTerm2 launches the service on its next start. Re-run or undo this any time with:
-
-```bash
-iterm2-harness-install              # (re-)create the AutoLaunch symlink
-iterm2-harness-install --uninstall  # remove the symlink (keep the formula)
-```
-
-Upgrade later with `brew update && brew upgrade iterm2-harness`.
-
-### From source
+From a checkout:
 
 ```bash
 ./install.sh
+# Or make an independent runtime copy, including the package:
+./install.sh --copy
 ```
 
-This creates a symlink at
-`~/Library/Application Support/iTerm2/Scripts/AutoLaunch/iterm2-harness.py`
-pointing at this repo's `iterm2-harness.py`. iTerm2 auto-runs scripts in
-`AutoLaunch/` on launch.
+Then run **iTerm2 > Scripts > AutoLaunch > iterm2-harness.py**, or restart iTerm2.
+The installer puts only the launcher symlink in AutoLaunch, not every module. It
+creates `~/.iterm2-harness/config.json` only if absent and preserves existing user
+configuration, credentials, and logs. `--uninstall` removes only the launcher.
+A copied runtime remains under `~/.iterm2-harness/runtime.*` for manual cleanup.
 
-To run immediately without restarting iTerm2: open the iTerm2 menu
-**Scripts > AutoLaunch > iterm2-harness.py**.
-
-### Other install options
+The Homebrew formula is intentionally **HEAD-only** until a tagged archive and
+checksum are published:
 
 ```bash
-./install.sh --copy                       # copy instead of symlink
-./install.sh --source /path/to/file.py    # custom source (used by brew)
-./install.sh --target /custom/dir         # custom AutoLaunch target
-./install.sh --uninstall                  # remove from AutoLaunch
+brew tap nullifyr/iterm2-harness https://github.com/nullifyr/iterm2-harness
+brew install --HEAD nullifyr/iterm2-harness/iterm2-harness
 ```
 
-### Homebrew compatibility
+This commit sets the code version to 2.1.0; it does not itself create a Git tag or
+GitHub release. Do not install a moving `main.tar.gz` as a purported fixed release.
 
-The installer is brew-friendly. In a formula:
+## Configuration and migration
 
-```ruby
-def install
-  prefix.install "iterm2-harness.py", "config.json", "install.sh"
-end
-
-def post_install
-  system "#{prefix}/install.sh", "--source", "#{prefix}/iterm2-harness.py"
-end
-```
-
-## Configuration
-
-`config.json` next to the script (auto-created on first run):
-
-```json
-{
-  "host": "0.0.0.0",
-  "port": 6770,
-  "file_access": {
-    "enabled": false,
-    "allowed_paths": []
-  },
-  "auth_prompt_timeout": 60
-}
-```
-
-### Authorization prompt
-
-`POST /api/v1/auth/request` shows a confirmation panel drawn by the harness
-process itself (via PyObjC), **not** by iTerm2. This matters: iTerm2's own
-`iterm2.Alert` is application-modal and runs on iTerm2's main thread, so an
-unanswered prompt freezes the entire iTerm2 UI *and* stalls its API server —
-with no way to time out. The PyObjC panel leaves iTerm2 untouched, and other
-harness requests continue to be served while it is open.
-
-- `auth_prompt_timeout` — seconds before an unanswered prompt closes itself
-  (default `60`; set `0` to wait forever). Override per-run with the
-  `ITERM2_HARNESS_AUTH_TIMEOUT` env var. The panel shows a live countdown.
-
-Outcomes are distinguishable by status code:
-
-| Result | Status |
-|---|---|
-| User pressed **Allow** | `201` + token |
-| User pressed **Deny**, or closed the panel | `403` |
-| No answer before the countdown expired | `408` |
-
-If the PyObjC panel cannot be shown (no window server, PyObjC missing), the
-harness logs `auth.prompt_fallback` and falls back to `iterm2.Alert` — which
-restores the old blocking, non-cancellable behaviour.
-
-### File-access config
-
-The file endpoints (`/api/v1/files*`) are **opt-in**:
-
-- `file_access.enabled` — master switch (default `false`). When `false`, all file endpoints return `403`.
-- `file_access.allowed_paths` — list of absolute path prefixes. A request path must `realpath()` under one of these. Empty list means *no restriction* (allow anywhere) once `enabled=true`. Always set realistic prefixes (e.g. `["/Users/me/Src", "/tmp"]`); the realpath check defeats `..` traversal.
-
-After editing config.json, call `POST /api/v1/reload` to pick up changes.
-
-Environment variables override the file:
-
-| Variable | Default |
-|---|---|
-| `ITERM2_HARNESS_HOST` | `0.0.0.0` |
-| `ITERM2_HARNESS_PORT` | `6770` |
-
-If the port is already in use, the server scans up to 50 ports forward (6770 → 6771 → …). The actual bound port is reported in `/api/v1/health` and the API directory.
-
-## Quick start
+The defaults are in `config.json`. Lookup order is `ITERM2_HARNESS_CONFIG`, then
+`~/.iterm2-harness/config.json`, then the file beside the real launcher. Host, port,
+and approval timeout can be overridden with `ITERM2_HARNESS_HOST`,
+`ITERM2_HARNESS_PORT`, and `ITERM2_HARNESS_AUTH_TIMEOUT`. `ITERM2_HARNESS_HOME`
+changes the state directory.
 
 ```bash
-# 1. Health check (no auth)
-curl -s http://127.0.0.1:6770/api/v1/health
+python3 iterm2-harness.py --version
+python3 iterm2-harness.py --check-config
+```
 
-# 2. Request authorization — iTerm2 will pop up a confirmation alert.
-TOKEN=$(curl -s -X POST http://127.0.0.1:6770/api/v1/auth/request \
+**Upgrade differences:** non-loopback binding now additionally requires
+`allow_remote: true`; empty file roots deny access even when enabled. Invalid
+configuration stops startup rather than silently broadening policy. The listener
+uses the configured port without silently choosing another. Approval deadlines
+are finite (10–120 seconds). Old Python 3.7/3.8 runtimes must be updated.
+
+Legacy raw-token records are atomically migrated to hash-only storage. Their
+privileges are frozen to the original seven capabilities; new lifecycle/status
+permissions are never silently added. Existing tokens without expiry remain
+usable, but should be reissued with an expiry and explicit session targets.
+
+Existing `/api/v1` routes have explicit compatibility aliases. They retain basic
+read/input operations, not every old permissive behavior: regex is disabled,
+multipart is rejected, booleans must actually be JSON booleans, file budgets are
+smaller, and input is no longer echoed in responses. New endpoints cannot be
+accessed through v1 to bypass v2 preconditions. **Move writers to v2**: v1 cannot
+provide the caller-supplied epoch/context/idempotency guarantees.
+
+## Start with read access
+
+```bash
+BASE=http://127.0.0.1:6770
+curl -sS -X POST "$BASE/api/v2/auth/request" \
   -H 'Content-Type: application/json' \
-  -d '{"device_name":"my-laptop"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
-
-# 3. Use the token from now on.
-curl -s http://127.0.0.1:6770/api/v1/sessions \
-  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+  -d '{"device_name":"observer","scopes":["terminal.read"],"expires_in":3600}'
 ```
 
-## Authorization
-
-- All endpoints **except** `/api/v1/health` and `/api/v1/auth/request` require `Authorization: Bearer <token>`.
-- Tokens are stored in `~/.iterm2-harness/tokens.json` (mode 0600). Surviving restarts.
-- Every approval/denial/reject is recorded in the audit log.
-
-## API
-
-Base URL: `http://<host>:<port>` (default `0.0.0.0:6770`).
-
-Calling any unknown path or wrong method returns the full API directory in the error body, so a client just needs to hit `/` to discover everything.
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| GET | `/` `/api` `/api/v1` | – | Returns the API directory. |
-| GET | `/api/v1/health` | – | `{status, host, port, server, _version}`. |
-| POST | `/api/v1/auth/request` | – | Request a token (shows an alert). Body: `{"device_name": "..."}`. |
-| GET | `/api/v1/auth/whoami` | ✓ | Validate the current token. |
-| POST | `/api/v1/reload` | ✓ | Restart this script in place. |
-| GET | `/api/v1/windows` | ✓ | Hierarchical windows → tabs → sessions. |
-| GET | `/api/v1/sessions` | ✓ | Flat session list. Filterable. |
-| GET | `/api/v1/sessions/{id}/screen` | ✓ | Screen contents, with paging. |
-| GET | `/api/v1/sessions/{id}/metadata` | ✓ | Working dir, command line, job name, size. |
-| POST | `/api/v1/sessions/{id}/send-text` | ✓ | Send text. Body: `{"text": "ls", "enter": true}`. `enter` defaults to false; when true, appends `\r`. |
-| GET    | `/api/v1/files?path=...`        | ✓ | Read a file. Add `base64=true` for binary. Requires `file_access` in config. |
-| POST   | `/api/v1/files?path=...`        | ✓ | Write a file. JSON body `{content,encoding,mkdir,append}` or `multipart/form-data` with field `file`. |
-| DELETE | `/api/v1/files?path=...`        | ✓ | Delete a file (not a directory). |
-| GET    | `/api/v1/files/list?path=...`   | ✓ | List a directory. Add `recursive=true` to walk. |
-| POST | `/api/v1/sessions/{id}/send-key` | ✓ | Send a special key. Body: `{"key": "ctrl+c"}`. |
-
-### `/api/v1/sessions` query filters
-
-All filters are AND'd. Omit for the full list.
-
-| Param | Description |
-|---|---|
-| `name` | Substring of session name (case-insensitive). |
-| `job` | `jobName` (running process name). Note: some tools rename their process — e.g. Claude Code reports `2.1.132` instead of `claude`. |
-| `command` | Substring of full `commandLine`. **Recommended for stable matching**, e.g. `command=claude`. |
-| `path` | Working directory substring. |
-| `regex=true` | Treat all four queries as regex patterns. |
-
-Example: list every session currently running `claude`:
+Approve the local dialog and keep the returned `token` private. A `session_ids`
+array narrows a grant to those concrete sessions; omitted/null means all sessions.
+The historical default when `scopes` is omitted is terminal read **and write**;
+request read-only explicitly for observers. The service never accepts tokens in
+query strings. Cache credentials privately per server origin, not in shared logs.
 
 ```bash
-curl -s "http://127.0.0.1:6770/api/v1/sessions?command=claude" \
-  -H "Authorization: Bearer $TOKEN"
+curl -sS "$BASE/api/v2/snapshot" -H "Authorization: Bearer $TOKEN"
+curl -N "$BASE/api/v2/events" -H "Authorization: Bearer $TOKEN"
 ```
 
-### `/api/v1/sessions/{id}/screen` query
+Snapshots and events are observations, not instructions or trusted command
+provenance. Missing Shell Integration, lost notifications, expired agent reports,
+and restarts produce unknown/incomplete state, never an invented successful exit.
 
-| Param | Default | Description |
-|---|---|---|
-| `limit` | `500` | Number of lines from the bottom. |
-| `offset` | `0` | Skip this many lines from the bottom (for paging history). |
-| `strip` | `false` | Collapse whitespace runs to a single space; drop empty lines. |
+For guarded input, obtain metadata plus a lease and send the current epoch,
+unique idempotency key, lease ID, and expected context. The complete example and
+request contracts are in [docs/API.md](docs/API.md). Retrying the same request in
+the same epoch returns its receipt; an unknown result requires inspection, not a
+new key and blind resubmission.
 
-`has_more: true` in the response means more history exists — bump `offset` to read further back.
+## Security boundary
 
-### Send-key supported keys
+`terminal.write` is execution-class authority: a writable shell can access the
+user's filesystem even if `files.write` is denied. Profile creation can execute
+profile startup commands. API scopes and leases are **not an OS sandbox**, and
+cannot exclude human input or native AI acting outside this harness.
 
-`enter` `return` `tab` `escape`/`esc` `space` `backspace` `delete`
-`up` `down` `left` `right` `home` `end`
-`ctrl+c` `ctrl+d` `ctrl+z` `ctrl+l` `ctrl+a` `ctrl+e` `ctrl+k` `ctrl+u` `ctrl+w` `ctrl+r` `ctrl+p` `ctrl+n`
-plus any `ctrl+{a-z}` combination.
+Input always suppresses iTerm2 broadcast propagation. Focused-session input,
+workspace creation, session closure, and reload receive local checks/approval;
+`require_input_approval: true` requires consent for every input action. Closing a
+session may terminate its running process. Named profiles must be allowlisted;
+the default profile may also execute startup code and always requires consent.
 
-### Error responses
+The transport is plaintext HTTP. Keep it on loopback and use an authenticated
+encrypted tunnel for remote access. Enabling a remote bind does not add TLS.
+Browser-origin requests and unexpected Host headers are rejected. See
+[SECURITY.md](SECURITY.md) for residual risks and exact limits.
 
-```json
-{
-  "error": "Not found: GET /api/v1/sesions",
-  "hint": "Unknown path. See api.endpoints below for all available endpoints. ...",
-  "api": { "service": "iterm2-harness", "version": "...", "endpoints": [ ... ] },
-  "_version": "0.1.0"
-}
+## Development and validation
+
+```bash
+python3 -m compileall -q iterm2_harness iterm2-harness.py tests tools
+python3 -m unittest discover -s tests -v
+python3 tools/generate_docs.py --check
+bash -n install.sh
 ```
 
-## Files and data layout
+Tests cover real local HTTP/SSE connections against public-API-shaped iTerm2
+adapters, credential migration, path confinement, replay, partial input, and
+listener cleanup. They do not simulate AppKit, a live PTY, or native AI. Complete
+[the live macOS checklist](docs/MACOS_SMOKE_TEST.md) before relying on unattended
+operation. The deeper design corrections are recorded in
+[docs/REVIEW_V2_1.md](docs/REVIEW_V2_1.md).
 
-```
-<repo>/
-  iterm2-harness.py        # the script (single file, no deps)
-  config.json              # {host, port}; auto-created
-  install.sh               # AutoLaunch installer
-
-~/Library/Application Support/iTerm2/Scripts/AutoLaunch/
-  iterm2-harness.py        # symlink (or copy) to the script
-
-~/.iterm2-harness/
-  tokens.json              # device → token map (mode 0600)
-  logs/
-    YYYY-MM-DD.log         # audit log, one JSON record per line
-```
-
-Audit events: `server.start`, `server.reload`, `server.port_busy`, `server.port_fallback`, `auth.request`, `auth.granted`, `auth.denied`, `auth.reject`, `request`, `error`, `notify.failed`.
-
-## Security notes
-
-v2 is intentionally secure-by-default:
-
-- The default listener is `127.0.0.1:6770`, not all LAN interfaces.
-- File access is disabled by default. When enabled, use `allowed_paths` to constrain it.
-- An empty `allowed_paths` list means unrestricted filesystem access **only after** file access has explicitly been enabled.
-- New tokens are stored as SHA-256 hashes in `~/.iterm2-harness/tokens.json`; the bearer secret is only returned at issuance.
-- Tokens carry explicit capabilities: `terminal.read`, `terminal.write`, `files.read`, `files.write`, `files.delete`, `service.reload`, and `auth.manage`.
-- Legacy v1 plaintext tokens continue to work during migration and are treated as full-capability credentials; revoke/reissue them when convenient.
-- For remote use, prefer an SSH tunnel, Tailscale, WireGuard, or another authenticated encrypted transport rather than exposing the plaintext HTTP listener directly.
-
-### v1 → v2 migration
-
-The network and file defaults changed. Existing `config.json` files are preserved, so an installation that explicitly used `0.0.0.0` or enabled file access will continue to do so. Fresh installs use the safer defaults.
-
-Clients that call only terminal endpoints can omit `scopes` during `POST /api/v1/auth/request`; the default is `terminal.read` + `terminal.write`. File access, reload, and token administration must be requested explicitly.
-
-```json
-{
-  "device_name": "codex",
-  "scopes": ["terminal.read", "terminal.write", "files.read", "files.write"]
-}
-```
-
-Token administrators can list issued credentials with `GET /api/v1/auth/tokens` and revoke one with `DELETE /api/v1/auth/tokens/{token_id}`; both require `auth.manage`.
-
-## License
-
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache-2.0; see [LICENSE](LICENSE).

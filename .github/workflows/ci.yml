@@ -1,21 +1,32 @@
 name: CI
-
 on:
   push:
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
-  test:
-    runs-on: macos-latest
+  contracts:
+    name: Unit and HTTP contracts (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.11"
-      - name: Syntax check
-        run: python -m py_compile iterm2-harness.py
-      - name: Unit tests
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m compileall -q iterm2_harness iterm2-harness.py tests tools
+      - name: Unit, adapter, HTTP and SSE contracts (no live iTerm2)
         run: python -m unittest discover -s tests -v
+      - name: Generated docs are current
+        run: python tools/generate_docs.py --check
+      - name: Installer syntax
+        run: bash -n install.sh
+      - name: Formula syntax
+        if: runner.os == 'macOS'
+        run: ruby -c Formula/iterm2-harness.rb

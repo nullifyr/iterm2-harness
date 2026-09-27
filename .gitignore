@@ -1,7 +1,4 @@
-.DS_Store
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .venv/
-venv/
-*.log
+.DS_Store

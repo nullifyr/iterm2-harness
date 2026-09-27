@@ -1,14 +1,25 @@
 # Changelog
 
-## 2.0.0 — 2026-09-26
+## 2.1.0 — second implementation tranche
 
-- Secure-by-default loopback listener and disabled file access for fresh installs.
-- Capability-scoped authorization and hashed-at-rest bearer tokens.
-- Token inventory/revocation endpoints gated by `auth.manage`.
-- Unified filesystem path authorization using canonical path containment.
-- Replaced private iTerm2 scrollback RPCs with public `Session.async_get_line_info` / `async_get_contents` inside a transaction.
-- Replaced direct websocket lifecycle inspection with iTerm2's documented `run_forever` daemon model.
-- Hardened the minimal HTTP parser and added finite resource budgets.
-- Bounded file reads, recursive listings, regex patterns, and terminal scrollback requests.
-- Added regression tests and GitHub Actions CI.
-- Corrected Homebrew/repository identity from `wsvn53` to `nullifyr`.
+- Modular public-SDK adapter, explicit task/listener ownership and bounded backend
+  watchdog; stable configured port, no private RPC/websocket dependency.
+- Scoped replayable SSE, epoch/gap recovery, prompt-ID-based command observations,
+  TTL reporter status, snapshots/focus, guarded session lifecycle and user variables.
+- Session-scoped expiring tokens; fix digest-as-bearer fallback, atomically migrate
+  legacy plaintext storage, and freeze legacy capabilities.
+- Serialized leased input, context checks, idempotency receipts, local approval,
+  broadcast suppression, and explicit partial/unknown outcomes.
+- Strict HTTP boundaries, browser Origin/Host checks, bounded connections/files,
+  descriptor-relative no-follow filesystem access, no unsafe regex or multipart.
+- Whole-package installers, persistent user configuration, HEAD-only Homebrew
+  development formula, canonical discovery/docs, expanded HTTP/security tests.
+- Native Workgroups/AI/browser adapters and structured command execution explicitly
+  remain unavailable. Live macOS/iTerm2/AppKit verification is still required.
+
+## 2.0.0
+
+Initial hardening: loopback/file-off defaults, scopes and hash-addressed tokens,
+public screen APIs, protocol limits and initial CI. The 2.1 review corrects the
+legacy authentication fallback, lifecycle assumptions and incomplete boundaries
+in that implementation. See docs/REVIEW_V2_1.md for the source-bound corrections.

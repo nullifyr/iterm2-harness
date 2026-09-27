@@ -1,97 +1,56 @@
 #!/usr/bin/env bash
-# iterm2-harness installer.
-#
-# By default this creates a symlink under iTerm2's AutoLaunch folder pointing
-# at iterm2-harness.py in this repo, so iTerm2 launches the service on startup.
-#
-# Usage:
-#   ./install.sh                       # Symlink install (default), source = this dir
-#   ./install.sh --source <path>       # Specify source .py path (used by brew formula)
-#   ./install.sh --copy                # Copy instead of symlink
-#   ./install.sh --target <dir>        # Custom iTerm2 Scripts target directory
-#   ./install.sh --uninstall           # Uninstall (remove the link/copy)
-#
-# Homebrew formula example:
-#   bin.install "iterm2-harness.py"
-#   (bin/"iterm2-harness-install").write <<~SH
-#     #!/bin/bash
-#     exec "#{prefix}/install.sh" --source "#{bin}/iterm2-harness.py" "$@"
-#   SH
-# or invoke directly during post_install:
-#   system "#{prefix}/install.sh", "--source", "#{bin}/iterm2-harness.py"
-
+# Install a package-aware launcher; keep Python modules OUT of AutoLaunch.
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_SOURCE="$SCRIPT_DIR/iterm2-harness.py"
-DEFAULT_TARGET_DIR="$HOME/Library/Application Support/iTerm2/Scripts/AutoLaunch"
-LINK_NAME="iterm2-harness.py"
-
-SOURCE=""
-TARGET_DIR=""
-MODE="link"     # link | copy
-ACTION="install"
-
+umask 077
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="$ROOT/iterm2-harness.py"
+TARGET_DIR="$HOME/Library/Application Support/iTerm2/Scripts/AutoLaunch"
+STATE="${ITERM2_HARNESS_HOME:-$HOME/.iterm2-harness}"
+MODE=link
+ACTION=install
+FORCE=false
+fail() { printf '%s\n' "$*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --source) SOURCE="$2"; shift 2 ;;
-    --target) TARGET_DIR="$2"; shift 2 ;;
-    --copy) MODE="copy"; shift ;;
-    --link) MODE="link"; shift ;;
-    --uninstall) ACTION="uninstall"; shift ;;
-    -h|--help)
-      sed -n '2,22p' "$0"
-      exit 0 ;;
-    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    --source|--target)
+      [[ $# -ge 2 && -n "$2" ]] || fail "Missing value for $1"
+      if [[ "$1" == --source ]]; then SOURCE="$2"; else TARGET_DIR="$2"; fi
+      shift 2 ;;
+    --copy) MODE=copy; shift ;;
+    --link) MODE=link; shift ;;
+    --uninstall) ACTION=uninstall; shift ;;
+    --force) FORCE=true; shift ;;
+    -h|--help) printf '%s\n' 'Usage: install.sh [--copy|--link] [--source FILE] [--target DIR] [--force] [--uninstall]'; exit 0 ;;
+    *) fail "Unknown argument: $1" ;;
   esac
 done
-
-SOURCE="${SOURCE:-$DEFAULT_SOURCE}"
-TARGET_DIR="${TARGET_DIR:-$DEFAULT_TARGET_DIR}"
-TARGET="$TARGET_DIR/$LINK_NAME"
-
-info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
-err()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
-
-if [[ "$ACTION" == "uninstall" ]]; then
-  if [[ -L "$TARGET" || -f "$TARGET" ]]; then
-    info "Removing $TARGET"
-    rm -f "$TARGET"
-  else
-    warn "Not found: $TARGET, skipping"
-  fi
+TARGET="$TARGET_DIR/iterm2-harness.py"
+if [[ "$ACTION" == uninstall ]]; then
+  if [[ -L "$TARGET" || -f "$TARGET" ]]; then rm -f "$TARGET"; fi
+  printf '%s\n' 'AutoLaunch entry removed. Configuration, tokens, logs, and copied runtimes were retained.'
   exit 0
 fi
-
-# Install flow.
-[[ -f "$SOURCE" ]] || err "Source file not found: $SOURCE"
-
-info "Source: $SOURCE"
-info "Target: $TARGET"
-info "Mode:   $MODE"
-
-mkdir -p "$TARGET_DIR"
-
-if [[ -e "$TARGET" || -L "$TARGET" ]]; then
-  # Idempotent: if the existing symlink already points at the same source, we're done.
-  if [[ -L "$TARGET" && "$(readlink "$TARGET")" == "$SOURCE" && "$MODE" == "link" ]]; then
-    info "Symlink already in place, skipping"
-    exit 0
-  fi
-  warn "Existing $TARGET will be overwritten"
-  rm -f "$TARGET"
+[[ -f "$SOURCE" ]] || fail "Missing source: $SOURCE"
+SOURCE_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+SOURCE="$SOURCE_DIR/$(basename "$SOURCE")"
+[[ -d "$SOURCE_DIR/iterm2_harness" ]] || fail 'The iterm2_harness package must be beside the launcher.'
+[[ ! -e "$TARGET" || -L "$TARGET" || "$FORCE" == true ]] || fail 'Existing non-symlink launcher: review it, then use --force to replace.'
+mkdir -p "$STATE" "$TARGET_DIR"
+chmod 700 "$STATE"
+if [[ ! -e "$STATE/config.json" && -f "$SOURCE_DIR/config.json" ]]; then
+  cp "$SOURCE_DIR/config.json" "$STATE/config.json"
 fi
-
-case "$MODE" in
-  link) ln -s "$SOURCE" "$TARGET" ;;
-  copy) cp "$SOURCE" "$TARGET" ;;
-esac
-
-# Make the source executable for convenient CLI debugging (iTerm2 doesn't require it).
-chmod +x "$SOURCE" 2>/dev/null || true
-
-info "Installed. iTerm2 will auto-launch the service on its next start."
-info "Run now: open iTerm2 > Scripts menu > AutoLaunch > $LINK_NAME"
-info "Config:  $(dirname "$SOURCE")/config.json"
-info "Data:    ~/.iterm2-harness/  (tokens.json, logs/)"
+if [[ "$MODE" == copy ]]; then
+  STAGE="$(mktemp -d "$STATE/runtime.XXXXXXXX")"
+  mkdir "$STAGE/iterm2_harness"
+  cp "$SOURCE" "$STAGE/iterm2-harness.py"
+  cp "$SOURCE_DIR"/iterm2_harness/*.py "$STAGE/iterm2_harness/"
+  chmod +x "$STAGE/iterm2-harness.py"
+  SOURCE="$STAGE/iterm2-harness.py"
+fi
+TEMP="$TARGET_DIR/.harness-link-$$"
+trap 'rm -f "$TEMP"' EXIT
+ln -s "$SOURCE" "$TEMP"
+mv -f "$TEMP" "$TARGET"
+printf 'Installed %s\nConfig: %s/config.json\n' "$TARGET" "$STATE"
+printf '%s\n' 'Run from iTerm2 > Scripts > AutoLaunch. Restart the harness after upgrading.'
