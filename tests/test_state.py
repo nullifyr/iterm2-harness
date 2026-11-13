@@ -4,7 +4,9 @@ from iterm2_harness.common import APIError
 from iterm2_harness.state import Actions, EventLog, Observations
 
 
-class StateTests(unittest.TestCase):
+class StateTests(unittest.IsolatedAsyncioTestCase):
+    # Python 3.9 binds asyncio.Event to the current loop at construction.
+    # Isolate the loop so preceding async test classes cannot leave it unset.
     def test_event_epoch_and_overflow_require_resync(self):
         log = EventLog(capacity=2, epoch='new')
         for _ in range(3): log.publish('event')
