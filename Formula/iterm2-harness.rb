@@ -9,7 +9,7 @@ class Iterm2Harness < Formula
 
   def install
     libexec.install "iterm2-harness.py", "iterm2_harness", "config.json", "install.sh"
-    prefix.install "README.md", "SECURITY.md", "CHANGELOG.md"
+    prefix.install "README.md", "SECURITY.md", "CHANGELOG.md", "docs"
     (bin/"iterm2-harness-install").write <<~SH
       #!/bin/bash
       exec "#{opt_prefix}/libexec/install.sh" --source "#{opt_prefix}/libexec/iterm2-harness.py" "$@"
@@ -33,5 +33,8 @@ class Iterm2Harness < Formula
   test do
     assert_predicate libexec/"iterm2_harness/server.py", :exist?
     assert_predicate bin/"iterm2-harness-install", :executable?
+    %w[API.md MACOS_SMOKE_TEST.md REVIEW_V2_1.md].each do |file|
+      assert_predicate prefix/"docs"/file, :exist?
+    end
   end
 end
